@@ -172,7 +172,7 @@ add_library(google_cloud_cpp_common
             terminate_handler.cc
             terminate_handler.h
             version.cc
-            version.h)
+            version.h internal/pipeline.cc internal/pipeline.h)
 target_link_libraries(google_cloud_cpp_common
                       PUBLIC Threads::Threads
                       PRIVATE google_cloud_cpp_common_options)
