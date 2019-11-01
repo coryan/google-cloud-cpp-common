@@ -170,7 +170,7 @@ add_library(
     terminate_handler.cc
     terminate_handler.h
     version.cc
-    version.h)
+    version.h channel.cc channel.h)
 target_link_libraries(
     google_cloud_cpp_common
     PUBLIC Threads::Threads
@@ -206,6 +206,7 @@ add_subdirectory(testing_util)
 
 if (BUILD_TESTING)
     set(google_cloud_cpp_common_unit_tests
+        channel_test.cc
         future_generic_test.cc
         future_generic_then_test.cc
         future_void_test.cc
