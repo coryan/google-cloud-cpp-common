@@ -16,8 +16,8 @@
 #define GOOGLE_CLOUD_CPP_GOOGLE_CLOUD_CHANNEL_H_
 
 #include "google/cloud/future.h"
-#include "google/cloud/optional.h"
 #include "google/cloud/internal/invoke_result.h"
+#include "google/cloud/optional.h"
 #include <deque>
 #include <limits>
 
@@ -34,67 +34,65 @@ auto when_all(Futures&&... /*futures*/)
 
 namespace internal {
 
-template <typename I, typename O>
-class channel_impl {
+enum class SinkState {
+  kReady,
+  kShutdown,
+};
+
+enum class SourceState {
+  kReady,
+  kShutdown,
+};
+
+template <typename I>
+class sink_impl {
  public:
-  virtual ~channel_impl() = default;
+  virtual ~sink_impl() = default;
+
+  virtual SinkState push(I value) = 0;
+  virtual future<SinkState> push_ready() = 0;
+  virtual void shutdown() = 0;
+};
+
+template <typename O>
+class source_impl {
+ public:
+  virtual ~source_impl() = default;
 
   virtual optional<O> pull() = 0;
-  virtual void push(I value) = 0;
-
-  virtual void shutdown() = 0;
-
-  virtual future<void> push_ready() = 0;
   virtual future<void> pull_ready() = 0;
 };
 
-template <typename I, typename C, typename O>
-class connector : public channel_impl<I, O> {
- public:
-  connector(std::shared_ptr<channel_impl<I, C>> left,
-            std::shared_ptr<channel_impl<C, O>> right)
-            : left_(std::move(left)), right_(std::move(right)) {
+template <typename T>
+std::pair<std::shared_ptr<sink_impl<T>>, std::shared_ptr<source_impl<T>>>
+make_buffered_channel_impl();
 
-  }
-
-  void start() {
-    auto lr = left_.pull_ready();
-    auto rr = right_.push_ready();
-    auto ready = when_all(lr, rr);
-    auto& left = left_;
-    auto& right = right_;
-    using when_all_result = decltype(ready);
-    ready.then([this, left, right](when_all_result f) {
-      auto p = f.get();
-      std::get<0>(p).get();
-      std::get<1>(p).get();
-      auto l = left->pull();
-      if (!l.has_value()) {
-        right_->shutdown();
-        return;
-      }
-      right->push(*std::move(l));
-      this->start();
-    });
-  }
-
-  optional<O> pull() override { return right_->pull(); }
-  void push(I value) override { return left_->push(std::move(value)); }
-  void shutdown() override { left_->shutdown(); }
-  future<void> push_ready() override { return left_->push_ready(); }
-  future<void> pull_ready() override { return right_->pull_ready(); }
-
- private:
-  std::shared_ptr<channel_impl<I, C>> left_;
-  std::shared_ptr<channel_impl<C, O>> right_;
-};
+template <typename C>
+void connect(std::shared_ptr<source_impl<C>> so,
+             std::shared_ptr<sink_impl<C>> si) {
+  auto& source = so;
+  auto& sink = si;
+  auto ready = when_all(source->pull_ready(), sink->push_ready());
+  ready.then([source, sink](decltype(ready) f) mutable {
+    auto p = f.get();
+    auto rx = std::get<0>(p).get();
+    auto tx = std::get<1>(p).get();
+    auto value = source->pull();
+    if (!value.has_value()) {
+      sink->shutdown();
+      return;
+    }
+    sink->push(*std::move(value));
+    connect(std::move(source), std::move(sink));
+  });
+}
 
 template <typename T>
-class buffered_channel : public channel_impl<T, T> {
+class buffered_channel {
  public:
   buffered_channel() = default;
 
-  optional<T> next() override {
+  optional<T> pull() {
     std::unique_lock<std::mutex> lk(mu_);
     if (is_shutdown_) {
       return {};
@@ -108,20 +106,43 @@ class buffered_channel : public channel_impl<T, T> {
     return value;
   }
 
-  void push(T value) override {
+  void push(T value) {
     std::unique_lock<std::mutex> lk(mu_);
     next_wait_.wait(lk, [this] { return can_push(); });
     buffer_.push_back(std::move(value));
     next_wait_.notify_all();
   }
 
-  void shutdown() override {
+  void shutdown() {
     std::lock_guard<std::mutex> lk(mu_);
     is_shutdown_ = true;
   }
 
-  future<void> push_ready() override { return {}; }
-  future<void> pull_ready() override { return {}; }
+  future<SinkState> push_ready() { return {}; }
+  future<void> pull_ready() { return {}; }
+
+  class source : public source_impl<T> {
+   public:
+    source(std::shared_ptr<buffered_channel> channel)
+        : channel_(std::move(channel)) {}
+
+    optional<T> pull() override { return channel_->pull(); }
+    future<void> pull_ready() override { return channel_->pull_ready(); }
+
+   private:
+    std::shared_ptr<buffered_channel> channel_;
+  };
+  class sink : public sink_impl<T> {
+   public:
+    sink(std::shared_ptr<buffered_channel> channel)
+        : channel_(std::move(channel)) {}
+
+    void push(T value) override { channel_->push(std::move(value)); }
+    future<void> push_ready() override { return channel_->push_ready(); }
+
+   private:
+    std::shared_ptr<buffered_channel> channel_;
+  };
 
  private:
   bool can_push() const { return buffer_.size() <= max_size_ - min_capacity_; }
@@ -136,18 +157,13 @@ class buffered_channel : public channel_impl<T, T> {
   std::size_t min_capacity_ = 1;
 };
 
-template <typename Callable, typename T = internal::invoke_result_t<Callable>>
-class generator_channel : public channel_impl<void, T> {
- public:
-  explicit generator_channel(Callable&& c) : callable_(std::forward<T>(c)) {}
-
-  T next() override { return callable_(); }
-  void push(T) override {}
-  future<void> on_ready() { return {}; }
-
- private:
-  Callable callable_;
-};
+template <typename T>
+std::pair<std::shared_ptr<sink_impl<T>>, std::shared_ptr<source_impl<T>>>
+make_buffered_channel_impl() {
+  auto channel = std::make_shared<buffered_channel<T>>();
+  return {std::make_shared<buffered_channel<T>::sink>(channel),
+          std::make_shared<buffered_channel<T>::source>(channel)};
+}
 
 }  // namespace internal
 
