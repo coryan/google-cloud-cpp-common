@@ -16,6 +16,7 @@
 #define GOOGLE_CLOUD_CPP_GOOGLE_CLOUD_CHANNEL_H_
 
 #include "google/cloud/future.h"
+#include "google/cloud/optional.h"
 #include "google/cloud/internal/invoke_result.h"
 #include <deque>
 #include <limits>
@@ -38,8 +39,10 @@ class channel_impl {
  public:
   virtual ~channel_impl() = default;
 
-  virtual O pull() = 0;
+  virtual optional<O> pull() = 0;
   virtual void push(I value) = 0;
+
+  virtual void shutdown() = 0;
 
   virtual future<void> push_ready() = 0;
   virtual future<void> pull_ready() = 0;
@@ -49,7 +52,10 @@ template <typename I, typename C, typename O>
 class connector : public channel_impl<I, O> {
  public:
   connector(std::shared_ptr<channel_impl<I, C>> left,
-            std::shared_ptr<channel_impl<C, O>> right);
+            std::shared_ptr<channel_impl<C, O>> right)
+            : left_(std::move(left)), right_(std::move(right)) {
+
+  }
 
   void start() {
     auto lr = left_.pull_ready();
@@ -57,14 +63,26 @@ class connector : public channel_impl<I, O> {
     auto ready = when_all(lr, rr);
     auto& left = left_;
     auto& right = right_;
-    ready.then([left, right](future<std::tuple<future<void>, future<void>>> f) {
+    using when_all_result = decltype(ready);
+    ready.then([this, left, right](when_all_result f) {
       auto p = f.get();
       std::get<0>(p).get();
       std::get<1>(p).get();
-      right->push(left.pull());
-
+      auto l = left->pull();
+      if (!l.has_value()) {
+        right_->shutdown();
+        return;
+      }
+      right->push(*std::move(l));
+      this->start();
     });
   }
+
+  optional<O> pull() override { return right_->pull(); }
+  void push(I value) override { return left_->push(std::move(value)); }
+  void shutdown() override { left_->shutdown(); }
+  future<void> push_ready() override { return left_->push_ready(); }
+  future<void> pull_ready() override { return right_->pull_ready(); }
 
  private:
   std::shared_ptr<channel_impl<I, C>> left_;
@@ -76,8 +94,11 @@ class buffered_channel : public channel_impl<T, T> {
  public:
   buffered_channel() = default;
 
-  T next() override {
+  optional<T> next() override {
     std::unique_lock<std::mutex> lk(mu_);
+    if (is_shutdown_) {
+      return {};
+    }
     next_wait_.wait(lk, [this] { return can_pull(); });
     T value = std::move(buffer_.front());
     buffer_.pop_front();
@@ -94,7 +115,13 @@ class buffered_channel : public channel_impl<T, T> {
     next_wait_.notify_all();
   }
 
-  future<void> on_ready() override { return make_ready_future(); }
+  void shutdown() override {
+    std::lock_guard<std::mutex> lk(mu_);
+    is_shutdown_ = true;
+  }
+
+  future<void> push_ready() override { return {}; }
+  future<void> pull_ready() override { return {}; }
 
  private:
   bool can_push() const { return buffer_.size() <= max_size_ - min_capacity_; }
@@ -104,6 +131,7 @@ class buffered_channel : public channel_impl<T, T> {
   std::condition_variable next_wait_;
   std::condition_variable push_wait_;
   std::deque<T> buffer_;
+  bool is_shutdown_ = false;
   std::size_t max_size_ = (std::numeric_limits<std::size_t>::max)();
   std::size_t min_capacity_ = 1;
 };
