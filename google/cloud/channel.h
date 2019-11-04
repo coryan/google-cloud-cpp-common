@@ -58,11 +58,6 @@ class action_semaphore {
  public:
   action_semaphore(std::size_t lwm, std::size_t hwm) : lwm_(lwm), hwm_(hwm) {}
 
-  enum handler_resolution {
-    kDone,
-    kReschedule,
-  };
-  using notification_handler = std::function<handler_resolution()>;
 
   void notify() {
     std::unique_lock<std::mutex> lk(mu_);
@@ -108,18 +103,7 @@ class action_semaphore {
     }
   }
 
-  void invoke_handler(notification_handler handler) {
-    auto resolution = handler();
-    if (resolution == kDone) {
-      return;
-    }
-    on_notify(std::move(handler));
-  }
 
-  enum class state {
-    kReady,
-    kBlocked,
-  };
 
   std::mutex mu_;
   std::condition_variable wait_for_lwm_;
@@ -184,30 +168,59 @@ class future_queue {
     action(std::move(value));
   }
 
-  void then(future_action<T> action) {
+  enum handler_resolution {
+    kDone,
+    kReschedule,
+  };
+  using notification_handler = std::function<handler_resolution()>;
+
+  void on_has_data(notification_handler h) {
     std::unique_lock<std::mutex> lk(mu_);
-    if (buffer_.empty()) {
-      actions_.push_back(std::move(action));
+    if (!buffer_.empty()) {
+      buffer_.pop_front(); // TODO(coryan)
+      lk.unlock();
+      invoke_has_data_handler(std::move(h));
       return;
     }
-    auto value = std::move(buffer_.front());
-    buffer_.pop_front();
-    if (buffer_.size() < lwm_) {
-      push_wait_.notify_all();
+    on_has_data_.push_back(std::move(h));
+  }
+
+  void on_has_capacity(notification_handler h) {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (state_ == queue_state::kAccepting) {
+      lk.unlock();
+      invoke_has_capacity_handler(std::move(h));
+      return;
     }
-    lk.unlock();
-    action(std::move(value));
+    on_has_capacity_.push_back(std::move(h));
   }
 
  private:
+  void invoke_has_data_handler(notification_handler handler) {
+    auto resolution = handler();
+    if (resolution == kDone) {
+      return;
+    }
+    on_has_data(std::move(handler));
+  }
+
+  void invoke_has_capacity_handler(notification_handler handler) {
+    auto resolution = handler();
+    if (resolution == kDone) {
+      return;
+    }
+    on_has_capacity(std::move(handler));
+  }
+
   std::mutex mu_;
   std::condition_variable push_wait_;
   std::condition_variable pull_wait_;
   std::deque<future_state<T>> buffer_;
-  std::deque<future_action<T>> actions_;
   std::size_t hwm_ = std::numeric_limits<std::size_t>::max();
   std::size_t lwm_ = std::numeric_limits<std::size_t>::max() - 1;
   queue_state state_ = queue_state::kAccepting;
+  std::deque<notification_handler> on_has_data_;
+  std::deque<notification_handler> on_has_capacity_;
 };
 
 template <typename I>
