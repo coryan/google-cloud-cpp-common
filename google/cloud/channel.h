@@ -25,13 +25,6 @@ namespace google {
 namespace cloud {
 inline namespace GOOGLE_CLOUD_CPP_NS {
 
-template <typename T>
-using decay_t = typename std::decay<T>::type;
-
-template <typename... Futures>
-auto when_all(Futures&&... /*futures*/)
-    -> future<std::tuple<decay_t<Futures>...>>;
-
 namespace internal {
 
 enum class queue_state {
@@ -59,6 +52,83 @@ template <>
 struct future_state<void> {
   future_contents contents;
   std::exception_ptr exception;
+};
+
+class action_semaphore {
+ public:
+  action_semaphore(std::size_t lwm, std::size_t hwm) : lwm_(lwm), hwm_(hwm) {}
+
+  enum handler_resolution {
+    kDone,
+    kReschedule,
+  };
+  using notification_handler = std::function<handler_resolution()>;
+
+  void notify() {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (!pending_.empty()) {
+      // Because there is a pending notification_handler, we can just signal it, without
+      // any changes to `current_`:
+      auto handler = std::move(pending_.front());
+      pending_.pop_front();
+      lk.unlock();
+      invoke_handler(std::move(handler));
+      return;
+    }
+    wait_for_lwm_.wait(lk, [this] { return state_ == state::kReady; });
+    ++current_;
+    wait_for_not_empty_.notify_all();
+    if (current_ >= hwm_) {
+      state_ = state::kBlocked;
+    }
+  }
+
+  void read() {
+    std::unique_lock<std::mutex> lk(mu_);
+    wait_for_not_empty_.wait(lk, [this] { return current_ > 0; });
+    read(lk);
+  }
+
+  void on_notify(notification_handler handler) {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (current_ > 0) {
+      read();
+      lk.unlock();
+      invoke_handler(std::move(handler));
+      return;
+    }
+    pending_.push_back(std::move(handler));
+  }
+
+ private:
+  void read(std::unique_lock<std::mutex>& ) {
+    if (--current_ < lwm_) {
+      state_ = state::kReady;
+      wait_for_lwm_.notify_all();
+    }
+  }
+
+  void invoke_handler(notification_handler handler) {
+    auto resolution = handler();
+    if (resolution == kDone) {
+      return;
+    }
+    on_notify(std::move(handler));
+  }
+
+  enum class state {
+    kReady,
+    kBlocked,
+  };
+
+  std::mutex mu_;
+  std::condition_variable wait_for_lwm_;
+  std::condition_variable wait_for_not_empty_;
+  std::size_t lwm_;
+  std::size_t hwm_;
+  std::size_t current_ = 0;
+  state state_ = state::kReady;
+  std::deque<notification_handler> pending_;
 };
 
 template <typename T>
@@ -193,30 +263,22 @@ class buffered_channel {
   buffered_channel() = default;
 
   optional<T> pull() {
-    std::unique_lock<std::mutex> lk(mu_);
-    if (is_shutdown_) {
-      return {};
+    auto s = queue_.pull();
+    switch (s.contents) {
+      case future_contents::kHasValue:
+        return std::move(s.value);
+      case future_contents::kHasException:
+        std::rethrow_exception(s.exception);
+      case future_contents::kDrain:
+        return {};
     }
-    next_wait_.wait(lk, [this] { return can_pull(); });
-    T value = std::move(buffer_.front());
-    buffer_.pop_front();
-    if (can_push()) {
-      push_wait_.notify_all();
-    }
-    return value;
   }
 
   void push(T value) {
-    std::unique_lock<std::mutex> lk(mu_);
-    next_wait_.wait(lk, [this] { return can_push(); });
-    buffer_.push_back(std::move(value));
-    next_wait_.notify_all();
+    queue_.push(future_state<T>{future_contents::kHasValue, std::move(value)});
   }
 
-  void shutdown() {
-    std::lock_guard<std::mutex> lk(mu_);
-    is_shutdown_ = true;
-  }
+  void shutdown() { queue_.shutdown(); }
 
   future<queue_state> push_ready() { return {}; }
   future<void> pull_ready() { return {}; }
@@ -232,6 +294,7 @@ class buffered_channel {
    private:
     std::shared_ptr<buffered_channel> channel_;
   };
+
   class sink : public sink_impl<T> {
    public:
     sink(std::shared_ptr<buffered_channel> channel)
@@ -245,16 +308,8 @@ class buffered_channel {
   };
 
  private:
-  bool can_push() const { return buffer_.size() <= max_size_ - min_capacity_; }
-  bool can_pull() const { return !buffer_.empty(); }
-
-  std::mutex mu_;
-  std::condition_variable next_wait_;
-  std::condition_variable push_wait_;
-  std::deque<T> buffer_;
-  bool is_shutdown_ = false;
-  std::size_t max_size_ = (std::numeric_limits<std::size_t>::max)();
-  std::size_t min_capacity_ = 1;
+  future_queue<T> queue_;
+  future_queue<void> push_ready_;
 };
 
 template <typename T>
