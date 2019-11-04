@@ -30,7 +30,7 @@ TEST(ChannelTest, Basic) {
   tested.push("baz");
 
   std::vector<std::string> actual{
-    tested.next(), tested.next(), tested.next()};
+    *tested.pull(), *tested.pull(), *tested.pull()};
   EXPECT_THAT(actual, ElementsAre("foo", "bar", "baz"));
 }
 

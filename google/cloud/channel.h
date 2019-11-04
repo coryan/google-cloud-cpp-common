@@ -34,19 +34,16 @@ auto when_all(Futures&&... /*futures*/)
 
 namespace internal {
 
-enum class SinkState {
-  kReady,
-  kShutdown,
-};
-
-enum class SourceState {
-  kReady,
+enum class queue_state {
+  kAccepting,
+  kDraining,
   kShutdown,
 };
 
 enum class future_contents {
   kHasValue,
   kHasException,
+  kDrain,
 };
 
 template <typename T>
@@ -58,7 +55,7 @@ struct future_state {
   };
 };
 
-template<>
+template <>
 struct future_state<void> {
   future_contents contents;
   std::exception_ptr exception;
@@ -70,20 +67,43 @@ using future_action = std::function<void(future_state<T>)>;
 template <typename T>
 class future_queue {
  public:
+  future_queue() = default;
+
+  void shutdown() {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (state_ != queue_state::kAccepting) {
+      // Already draining or shutdown.
+      return;
+    }
+    state_ = buffer_.empty() ? queue_state::kShutdown : queue_state::kDraining;
+    while (!actions_.empty()) {
+      auto action = std::move(actions_.front());
+      actions_.pop_front();
+      lk.unlock();
+      action(future_state<T>{future_contents::kDrain});
+      lk.lock();
+    }
+  }
+
   future_state<T> pull() {
     std::unique_lock<std::mutex> lk(mu_);
-    pull_wait_.wait(lk, [this] {
-      return !buffer_.empty();
-    });
+    pull_wait_.wait(lk, [this] { return !buffer_.empty(); });
     auto value = std::move(buffer_.front());
     buffer_.pop_front();
+    if (buffer_.size() < lwm_) {
+      push_wait_.notify_all();
+    }
     lk.unlock();
     return value;
   }
 
   void push(future_state<T> value) {
     std::unique_lock<std::mutex> lk(mu_);
+    if (state_ != queue_state::kAccepting) {
+      return;
+    }
     if (actions_.empty()) {
+      push_wait_.wait(lk, [this] { return buffer_.size() < hwm_; });
       buffer_.push_back(std::move(value));
       pull_wait_.notify_all();
       return;
@@ -102,15 +122,22 @@ class future_queue {
     }
     auto value = std::move(buffer_.front());
     buffer_.pop_front();
+    if (buffer_.size() < lwm_) {
+      push_wait_.notify_all();
+    }
     lk.unlock();
     action(std::move(value));
   }
 
  private:
   std::mutex mu_;
+  std::condition_variable push_wait_;
   std::condition_variable pull_wait_;
   std::deque<future_state<T>> buffer_;
   std::deque<future_action<T>> actions_;
+  std::size_t hwm_ = std::numeric_limits<std::size_t>::max();
+  std::size_t lwm_ = std::numeric_limits<std::size_t>::max() - 1;
+  queue_state state_ = queue_state::kAccepting;
 };
 
 template <typename I>
@@ -118,8 +145,9 @@ class sink_impl {
  public:
   virtual ~sink_impl() = default;
 
-  virtual SinkState push(I value) = 0;
-  virtual future<SinkState> push_ready() = 0;
+  virtual queue_state push(I value) = 0;
+  virtual queue_state push_exception(std::exception_ptr) = 0;
+  virtual void push_ready(future_action<void> callback) = 0;
   virtual void shutdown() = 0;
 };
 
@@ -129,7 +157,7 @@ class source_impl {
   virtual ~source_impl() = default;
 
   virtual optional<O> pull() = 0;
-  virtual future<void> pull_ready() = 0;
+  virtual void pull_ready(future_action<O> callback) = 0;
 };
 
 template <typename C>
@@ -137,18 +165,25 @@ void connect(std::shared_ptr<source_impl<C>> so,
              std::shared_ptr<sink_impl<C>> si) {
   auto& source = so;
   auto& sink = si;
-  auto ready = when_all(source->pull_ready(), sink->push_ready());
-  ready.then([source, sink](decltype(ready) f) mutable {
-    auto p = f.get();
-    auto rx = std::get<0>(p).get();
-    auto tx = std::get<1>(p).get();
-    auto value = source->pull();
-    if (!value.has_value()) {
-      sink->shutdown();
+
+  auto transfer = [source, sink](future_state<C> source_ready,
+                                 future_state<void>) {
+    auto state = [&] {
+      if (source_ready.contents == future_contents::kHasException) {
+        return sink->push_exception(std::move(source_ready.exception));
+      }
+      return sink->push(std::move(source_ready.value));
+    }();
+    if (state == queue_state::kShutdown) {
       return;
     }
-    sink->push(*std::move(value));
-    connect(std::move(source), std::move(sink));
+    connect(source, sink);
+  };
+
+  source->then([transfer](future_state<C> source_ready) {
+    sink->then([&](future_state<void> sink_ready) {
+      transfer(std::move(source_ready), std::move(sink_ready));
+    });
   });
 }
 
@@ -183,7 +218,7 @@ class buffered_channel {
     is_shutdown_ = true;
   }
 
-  future<SinkState> push_ready() { return {}; }
+  future<queue_state> push_ready() { return {}; }
   future<void> pull_ready() { return {}; }
 
   class source : public source_impl<T> {
@@ -242,13 +277,13 @@ template <typename T>
 class channel {
  public:
   channel() {
-    std::tie(source_impl_, sink_impl_) = internal::make_buffered_channel_impl<T>();
+    std::tie(source_impl_, sink_impl_) =
+        internal::make_buffered_channel_impl<T>();
   }
 
   std::pair<sink<T>, source<T>> endpoints() &&;
 
  private:
-
   std::shared_ptr<internal::source_impl<T>> source_impl_;
   std::shared_ptr<internal::sink_impl<T>> sink_impl_;
 };
@@ -265,7 +300,9 @@ class source {
   /// available.
   template <typename Callable,
             typename U = typename internal::invoke_result_t<Callable, T>>
-  source<U> on_each(Callable&& /*c*/) && { return {}; }
+  source<U> on_each(Callable&& /*c*/) && {
+    return {};
+  }
 
  private:
   friend class channel<T>;
@@ -278,9 +315,7 @@ class source {
 template <typename T>
 class sink {
  public:
-  void push(T value) {
-    impl_->push(std::move(value));
-  }
+  void push(T value) { impl_->push(std::move(value)); }
 
  private:
   friend class channel<T>;
