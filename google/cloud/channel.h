@@ -44,6 +44,75 @@ enum class SourceState {
   kShutdown,
 };
 
+enum class future_contents {
+  kHasValue,
+  kHasException,
+};
+
+template <typename T>
+struct future_state {
+  future_contents contents;
+  union {
+    T value;
+    std::exception_ptr exception;
+  };
+};
+
+template<>
+struct future_state<void> {
+  future_contents contents;
+  std::exception_ptr exception;
+};
+
+template <typename T>
+using future_action = std::function<void(future_state<T>)>;
+
+template <typename T>
+class future_queue {
+ public:
+  future_state<T> pull() {
+    std::unique_lock<std::mutex> lk(mu_);
+    pull_wait_.wait(lk, [this] {
+      return !buffer_.empty();
+    });
+    auto value = std::move(buffer_.front());
+    buffer_.pop_front();
+    lk.unlock();
+    return value;
+  }
+
+  void push(future_state<T> value) {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (actions_.empty()) {
+      buffer_.push_back(std::move(value));
+      pull_wait_.notify_all();
+      return;
+    }
+    auto action = std::move(actions_.front());
+    actions_.pop_front();
+    lk.unlock();
+    action(std::move(value));
+  }
+
+  void then(future_action<T> action) {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (buffer_.empty()) {
+      actions_.push_back(std::move(action));
+      return;
+    }
+    auto value = std::move(buffer_.front());
+    buffer_.pop_front();
+    lk.unlock();
+    action(std::move(value));
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable pull_wait_;
+  std::deque<future_state<T>> buffer_;
+  std::deque<future_action<T>> actions_;
+};
+
 template <typename I>
 class sink_impl {
  public:
@@ -164,7 +233,7 @@ make_buffered_channel_impl() {
 }  // namespace internal
 
 template <typename T>
-class generator;
+class source;
 
 template <typename T>
 class sink;
@@ -172,63 +241,59 @@ class sink;
 template <typename T>
 class channel {
  public:
-  channel() : impl_(std::make_shared<internal::buffered_channel<T>>()) {}
+  channel() {
+    std::tie(source_impl_, sink_impl_) = internal::make_buffered_channel_impl<T>();
+  }
 
-  void push(T value) { impl_->push(std::move(value)); }
-
-  future<sink<T>> on_ready() && { return {}; }
-
-  generator<T> generator();
+  std::pair<sink<T>, source<T>> endpoints() &&;
 
  private:
-  friend class sink<T>;
-  explicit channel(std::shared_ptr<internal::channel_impl<T>> impl)
-      : impl_(std::move(impl)) {}
 
-  std::shared_ptr<internal::channel_impl<T>> impl_;
+  std::shared_ptr<internal::source_impl<T>> source_impl_;
+  std::shared_ptr<internal::sink_impl<T>> sink_impl_;
 };
 
 template <typename T>
-class generator {
+class source {
  public:
-  generator() = default;
+  source() = default;
 
   /// Blocks until a value is available, returns that value.
-  T next() { return channel_->next(); }
+  optional<T> pull() { return impl_->pull(); }
 
   /// Associates Callable with this generator, called every time a value is
   /// available.
   template <typename Callable,
             typename U = typename internal::invoke_result_t<Callable, T>>
-  generator<U> on_each(Callable&& c) && {
-    using channel = internal::composed_channel<T, Callable>;
-
-    return generator<U>(std::make_shared<channel>(std::forward<Callable>(c),
-                                                  std::move(channel_)));
-  }
+  source<U> on_each(Callable&& /*c*/) && { return {}; }
 
  private:
-  explicit generator(std::shared_ptr<internal::channel_impl<T>> c)
-      : channel_(std::move(c)) {}
+  friend class channel<T>;
+  explicit source(std::shared_ptr<internal::source_impl<T>> c)
+      : impl_(std::move(c)) {}
 
-  std::shared_ptr<internal::channel_impl<T>> channel_;
+  std::shared_ptr<internal::source_impl<T>> impl_;
 };
 
 template <typename T>
 class sink {
  public:
-  channel<T> operator()(T value) {
+  void push(T value) {
     impl_->push(std::move(value));
-    return channel<T>(std::move(impl_));
   }
 
  private:
   friend class channel<T>;
-  explicit sink(std::shared_ptr<internal::channel_impl<T>> impl)
+  explicit sink(std::shared_ptr<internal::source_impl<T>> impl)
       : impl_(std::move(impl)) {}
 
-  std::shared_ptr<internal::channel_impl<T>> impl_;
+  std::shared_ptr<internal::source_impl<T>> impl_;
 };
+
+template <typename T>
+std::pair<sink<T>, source<T>> channel<T>::endpoints() && {
+  return {sink<T>(std::move(sink_impl_)), source<T>(std::move(source_impl_))};
+}
 
 }  // namespace GOOGLE_CLOUD_CPP_NS
 }  // namespace cloud
