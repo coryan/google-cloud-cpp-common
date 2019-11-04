@@ -63,10 +63,6 @@ class source_impl {
   virtual future<void> pull_ready() = 0;
 };
 
-template <typename T>
-std::pair<std::shared_ptr<sink_impl<T>>, std::shared_ptr<source_impl<T>>>
-make_buffered_channel_impl();
-
 template <typename C>
 void connect(std::shared_ptr<source_impl<C>> so,
              std::shared_ptr<sink_impl<C>> si) {
