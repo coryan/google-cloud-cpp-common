@@ -33,12 +33,6 @@ enum class queue_state {
   kShutdown,
 };
 
-enum class future_contents {
-  kHasValue,
-  kHasException,
-  kDrain,
-};
-
 template <typename T>
 struct future_state : absl::variant<absl::monostate, std::exception_ptr, T> {
   using absl::variant<absl::monostate, std::exception_ptr, T>::variant;
@@ -240,6 +234,7 @@ make_buffered_channel_impl() {
           std::make_shared<typename buffered_channel<T>::source>(channel)};
 }
 
+#if 0
 template <typename C>
 void connect(std::shared_ptr<source_impl<C>> so,
              std::shared_ptr<sink_impl<C>> si) {
@@ -249,8 +244,9 @@ void connect(std::shared_ptr<source_impl<C>> so,
   auto transfer = [source, sink](future_state<C> source_ready,
                                  future_state<void>) {
     auto state = [&] {
-      if (source_ready.contents == future_contents::kHasException) {
-        return sink->push_exception(std::move(source_ready.exception));
+      if (source_ready.index() == 1U) {
+        return sink->push_exception(std::move(
+            absl::get<std::exception_ptr>(source_ready)));
       }
       return sink->push(std::move(source_ready.value));
     }();
@@ -266,6 +262,7 @@ void connect(std::shared_ptr<source_impl<C>> so,
     });
   });
 }
+#endif // 0
 
 }  // namespace internal
 
