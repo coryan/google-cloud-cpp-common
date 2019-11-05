@@ -42,77 +42,14 @@ enum class future_contents {
 template <typename T>
 struct future_state {
   future_contents contents;
-  union {
-    T value;
-    std::exception_ptr exception;
-  };
+  optional<T> value;
+  std::exception_ptr exception;
 };
 
 template <>
 struct future_state<void> {
   future_contents contents;
   std::exception_ptr exception;
-};
-
-class action_semaphore {
- public:
-  action_semaphore(std::size_t lwm, std::size_t hwm) : lwm_(lwm), hwm_(hwm) {}
-
-
-  void notify() {
-    std::unique_lock<std::mutex> lk(mu_);
-    if (!pending_.empty()) {
-      // Because there is a pending notification_handler, we can just signal it, without
-      // any changes to `current_`:
-      auto handler = std::move(pending_.front());
-      pending_.pop_front();
-      lk.unlock();
-      invoke_handler(std::move(handler));
-      return;
-    }
-    wait_for_lwm_.wait(lk, [this] { return state_ == state::kReady; });
-    ++current_;
-    wait_for_not_empty_.notify_all();
-    if (current_ >= hwm_) {
-      state_ = state::kBlocked;
-    }
-  }
-
-  void read() {
-    std::unique_lock<std::mutex> lk(mu_);
-    wait_for_not_empty_.wait(lk, [this] { return current_ > 0; });
-    read(lk);
-  }
-
-  void on_notify(notification_handler handler) {
-    std::unique_lock<std::mutex> lk(mu_);
-    if (current_ > 0) {
-      read();
-      lk.unlock();
-      invoke_handler(std::move(handler));
-      return;
-    }
-    pending_.push_back(std::move(handler));
-  }
-
- private:
-  void read(std::unique_lock<std::mutex>& ) {
-    if (--current_ < lwm_) {
-      state_ = state::kReady;
-      wait_for_lwm_.notify_all();
-    }
-  }
-
-
-
-  std::mutex mu_;
-  std::condition_variable wait_for_lwm_;
-  std::condition_variable wait_for_not_empty_;
-  std::size_t lwm_;
-  std::size_t hwm_;
-  std::size_t current_ = 0;
-  state state_ = state::kReady;
-  std::deque<notification_handler> pending_;
 };
 
 template <typename T>
@@ -130,9 +67,9 @@ class future_queue {
       return;
     }
     state_ = buffer_.empty() ? queue_state::kShutdown : queue_state::kDraining;
-    while (!actions_.empty()) {
-      auto action = std::move(actions_.front());
-      actions_.pop_front();
+    while (!on_has_data_.empty()) {
+      auto action = std::move(on_has_data_.front());
+      on_has_data_.pop_front();
       lk.unlock();
       action(future_state<T>{future_contents::kDrain});
       lk.lock();
@@ -142,11 +79,7 @@ class future_queue {
   future_state<T> pull() {
     std::unique_lock<std::mutex> lk(mu_);
     pull_wait_.wait(lk, [this] { return !buffer_.empty(); });
-    auto value = std::move(buffer_.front());
-    buffer_.pop_front();
-    if (buffer_.size() < lwm_) {
-      push_wait_.notify_all();
-    }
+    auto value = pop(lk);
     lk.unlock();
     return value;
   }
@@ -156,60 +89,68 @@ class future_queue {
     if (state_ != queue_state::kAccepting) {
       return;
     }
-    if (actions_.empty()) {
+    if (on_has_data_.empty()) {
       push_wait_.wait(lk, [this] { return buffer_.size() < hwm_; });
       buffer_.push_back(std::move(value));
       pull_wait_.notify_all();
       return;
     }
-    auto action = std::move(actions_.front());
-    actions_.pop_front();
+    auto action = std::move(on_has_data_.front());
+    on_has_data_.pop_front();
     lk.unlock();
-    action(std::move(value));
+    invoke_has_data_handler(std::move(action), std::move(value));
   }
 
   enum handler_resolution {
     kDone,
     kReschedule,
   };
-  using notification_handler = std::function<handler_resolution()>;
+  using on_data_handler = std::function<handler_resolution(future_state<T>)>;
+  using on_capacity_handler = std::function<void(queue_state)>;
 
-  void on_has_data(notification_handler h) {
+  void on_has_data(on_data_handler h) {
     std::unique_lock<std::mutex> lk(mu_);
     if (!buffer_.empty()) {
-      buffer_.pop_front(); // TODO(coryan)
+      auto value = pop(lk);
       lk.unlock();
-      invoke_has_data_handler(std::move(h));
+      invoke_has_data_handler(std::move(h), std::move(value));
       return;
     }
     on_has_data_.push_back(std::move(h));
   }
 
-  void on_has_capacity(notification_handler h) {
+  void on_has_capacity(on_capacity_handler h) {
     std::unique_lock<std::mutex> lk(mu_);
     if (state_ == queue_state::kAccepting) {
       lk.unlock();
-      invoke_has_capacity_handler(std::move(h));
+      invoke_has_capacity_handler(h, queue_state::kAccepting);
       return;
     }
     on_has_capacity_.push_back(std::move(h));
   }
 
  private:
-  void invoke_has_data_handler(notification_handler handler) {
-    auto resolution = handler();
+  future_state<T> pop(std::unique_lock<std::mutex>&) {
+    auto value = std::move(buffer_.front());
+    buffer_.pop_front();
+    if (state_ == queue_state::kDraining && buffer_.size() < lwm_) {
+      state_ = queue_state::kAccepting;
+      push_wait_.notify_all();
+    }
+    return value;
+  }
+
+  void invoke_has_data_handler(on_data_handler handler, future_state<T> value) {
+    auto resolution = handler(std::move(value));
     if (resolution == kDone) {
       return;
     }
     on_has_data(std::move(handler));
   }
 
-  void invoke_has_capacity_handler(notification_handler handler) {
-    auto resolution = handler();
-    if (resolution == kDone) {
-      return;
-    }
-    on_has_capacity(std::move(handler));
+  void invoke_has_capacity_handler(on_capacity_handler const& handler,
+                                   queue_state state) {
+    handler(state);
   }
 
   std::mutex mu_;
@@ -219,8 +160,8 @@ class future_queue {
   std::size_t hwm_ = std::numeric_limits<std::size_t>::max();
   std::size_t lwm_ = std::numeric_limits<std::size_t>::max() - 1;
   queue_state state_ = queue_state::kAccepting;
-  std::deque<notification_handler> on_has_data_;
-  std::deque<notification_handler> on_has_capacity_;
+  std::deque<on_data_handler> on_has_data_;
+  std::deque<on_capacity_handler> on_has_capacity_;
 };
 
 template <typename I>
@@ -243,6 +184,7 @@ class source_impl {
   virtual void pull_ready(future_action<O> callback) = 0;
 };
 
+#if 0
 template <typename C>
 void connect(std::shared_ptr<source_impl<C>> so,
              std::shared_ptr<sink_impl<C>> si) {
@@ -332,9 +274,10 @@ make_buffered_channel_impl() {
   return {std::make_shared<buffered_channel<T>::sink>(channel),
           std::make_shared<buffered_channel<T>::source>(channel)};
 }
-
+#endif  // 0
 }  // namespace internal
 
+#if 0
 template <typename T>
 class source;
 
@@ -397,6 +340,7 @@ template <typename T>
 std::pair<sink<T>, source<T>> channel<T>::endpoints() && {
   return {sink<T>(std::move(sink_impl_)), source<T>(std::move(source_impl_))};
 }
+#endif  // 0
 
 }  // namespace GOOGLE_CLOUD_CPP_NS
 }  // namespace cloud

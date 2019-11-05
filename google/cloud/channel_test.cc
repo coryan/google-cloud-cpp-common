@@ -19,22 +19,23 @@
 namespace google {
 namespace cloud {
 inline namespace GOOGLE_CLOUD_CPP_NS {
+namespace internal {
 namespace {
 
 using ::testing::ElementsAre;
 
-TEST(ChannelTest, Basic) {
-  internal::buffered_channel<std::string> tested;
-  tested.push("foo");
-  tested.push("bar");
-  tested.push("baz");
-
+TEST(FutureQueueTest, Basic) {
+  future_queue<std::string> tested;
+  tested.push(future_state<std::string>{future_contents::kHasValue, "foo", {}});
+  tested.push(future_state<std::string>{future_contents::kHasValue, "bar", {}});
+  tested.push(future_state<std::string>{future_contents::kHasValue, "baz", {}});
   std::vector<std::string> actual{
-    *tested.pull(), *tested.pull(), *tested.pull()};
+      *tested.pull().value, *tested.pull().value, *tested.pull().value};
   EXPECT_THAT(actual, ElementsAre("foo", "bar", "baz"));
 }
 
 }  // namespace
+}  // namespace internal
 }  // namespace GOOGLE_CLOUD_CPP_NS
 }  // namespace cloud
 }  // namespace google
