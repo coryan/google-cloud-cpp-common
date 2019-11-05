@@ -25,7 +25,7 @@ namespace {
 using ::testing::ElementsAre;
 
 TEST(FutureQueueTest, Basic) {
-  future_queue<std::string> tested;
+  buffered_channel<std::string> tested;
   tested.push(future_state<std::string>{"foo"});
   tested.push(future_state<std::string>{"bar"});
   tested.push(future_state<std::string>{"baz"});
@@ -33,6 +33,23 @@ TEST(FutureQueueTest, Basic) {
       absl::get<std::string>(tested.pull()),
       absl::get<std::string>(tested.pull()),
       absl::get<std::string>(tested.pull()),
+  };
+  EXPECT_THAT(actual, ElementsAre("foo", "bar", "baz"));
+}
+
+TEST(FutureQueueTest, MakeBufferedChannel) {
+  std::shared_ptr<sink_impl<std::string>> tx;
+  std::shared_ptr<source_impl<std::string>> rx;
+  std::tie(tx, rx) = make_buffered_channel_impl<std::string>();
+
+  tx->push("foo");
+  tx->push("bar");
+  tx->push("baz");
+
+  std::vector<std::string> actual{
+      *rx->pull(),
+      *rx->pull(),
+      *rx->pull(),
   };
   EXPECT_THAT(actual, ElementsAre("foo", "bar", "baz"));
 }

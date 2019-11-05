@@ -38,7 +38,9 @@ cc_library(
     name = "google_cloud_cpp_common",
     srcs = google_cloud_cpp_common_srcs + ["internal/build_info.cc"],
     hdrs = google_cloud_cpp_common_hdrs,
-    deps = [],
+    deps = [
+      "@com_google_absl//absl/types:variant"
+    ],
 )
 
 load(

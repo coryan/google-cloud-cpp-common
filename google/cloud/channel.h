@@ -52,11 +52,41 @@ struct future_state<void> : absl::variant<absl::monostate, std::exception_ptr> {
 template <typename T>
 using future_action = std::function<void(future_state<T>)>;
 
+enum on_data_resolution {
+  kDone,
+  kReschedule,
+};
+
+template <typename T>
+using on_data_handler = std::function<on_data_resolution(future_state<T>)>;
+
+using on_capacity_handler = std::function<void(queue_state)>;
+
+template <typename I>
+class sink_impl {
+ public:
+  virtual ~sink_impl() = default;
+
+  virtual void push(I value) = 0;
+  virtual void push_exception(std::exception_ptr) = 0;
+  virtual void on_has_capacity(on_capacity_handler h) = 0;
+  virtual void shutdown() = 0;
+};
+
+template <typename O>
+class source_impl {
+ public:
+  virtual ~source_impl() = default;
+
+  virtual optional<O> pull() = 0;
+  virtual void on_has_data(on_data_handler<O> h) = 0;
+};
+
 // A queue with lwm and hwm for capacity.
 template <typename T>
-class future_queue {
+class buffered_channel {
  public:
-  future_queue() = default;
+  buffered_channel() = default;
 
   void shutdown() {
     std::unique_lock<std::mutex> lk(mu_);
@@ -69,7 +99,7 @@ class future_queue {
       auto action = std::move(on_has_data_.front());
       on_has_data_.pop_front();
       lk.unlock();
-      action(future_state<T>{future_contents::kDrain});
+      action(future_state<T>{});
       lk.lock();
     }
   }
@@ -99,14 +129,7 @@ class future_queue {
     invoke_has_data_handler(std::move(action), std::move(value));
   }
 
-  enum handler_resolution {
-    kDone,
-    kReschedule,
-  };
-  using on_data_handler = std::function<handler_resolution(future_state<T>)>;
-  using on_capacity_handler = std::function<void(queue_state)>;
-
-  void on_has_data(on_data_handler h) {
+  void on_has_data(on_data_handler<T> h) {
     std::unique_lock<std::mutex> lk(mu_);
     if (!buffer_.empty()) {
       auto value = pop(lk);
@@ -127,6 +150,52 @@ class future_queue {
     on_has_capacity_.push_back(std::move(h));
   }
 
+  class source : public source_impl<T> {
+   public:
+    explicit source(std::shared_ptr<buffered_channel> channel)
+        : channel_(std::move(channel)) {}
+
+    optional<T> pull() override {
+      auto value = channel_->pull();
+      switch (value.index()) {
+        case 0:
+          return {};
+        case 1:
+          std::rethrow_exception(absl::get<std::exception_ptr>(value));
+        case 2:
+          return absl::get<T>(value);
+        default:
+          break;
+      }
+      throw std::future_error(std::future_errc::no_state);
+    }
+
+    void on_has_data(on_data_handler<T> handler) override {
+      channel_->on_has_data(std::move(handler));
+    }
+
+   private:
+    std::shared_ptr<buffered_channel> channel_;
+  };
+
+  class sink : public sink_impl<T> {
+   public:
+    explicit sink(std::shared_ptr<buffered_channel> channel)
+        : channel_(std::move(channel)) {}
+
+    void push(T value) override { channel_->push(std::move(value)); }
+    void push_exception(std::exception_ptr ex) override {
+      channel_->push(std::move(ex));
+    }
+    void on_has_capacity(on_capacity_handler h) override {
+      channel_->on_has_capacity(std::move(h));
+    }
+    void shutdown() override { channel_->shutdown(); }
+
+   private:
+    std::shared_ptr<buffered_channel> channel_;
+  };
+
  private:
   future_state<T> pop(std::unique_lock<std::mutex>&) {
     auto value = std::move(buffer_.front());
@@ -138,7 +207,8 @@ class future_queue {
     return value;
   }
 
-  void invoke_has_data_handler(on_data_handler handler, future_state<T> value) {
+  void invoke_has_data_handler(on_data_handler<T> handler,
+                               future_state<T> value) {
     auto resolution = handler(std::move(value));
     if (resolution == kDone) {
       return;
@@ -158,31 +228,18 @@ class future_queue {
   std::size_t hwm_ = std::numeric_limits<std::size_t>::max();
   std::size_t lwm_ = std::numeric_limits<std::size_t>::max() - 1;
   queue_state state_ = queue_state::kAccepting;
-  std::deque<on_data_handler> on_has_data_;
+  std::deque<on_data_handler<T>> on_has_data_;
   std::deque<on_capacity_handler> on_has_capacity_;
 };
 
-template <typename I>
-class sink_impl {
- public:
-  virtual ~sink_impl() = default;
+template <typename T>
+std::pair<std::shared_ptr<sink_impl<T>>, std::shared_ptr<source_impl<T>>>
+make_buffered_channel_impl() {
+  auto channel = std::make_shared<buffered_channel<T>>();
+  return {std::make_shared<typename buffered_channel<T>::sink>(channel),
+          std::make_shared<typename buffered_channel<T>::source>(channel)};
+}
 
-  virtual queue_state push(I value) = 0;
-  virtual queue_state push_exception(std::exception_ptr) = 0;
-  virtual void push_ready(future_action<void> callback) = 0;
-  virtual void shutdown() = 0;
-};
-
-template <typename O>
-class source_impl {
- public:
-  virtual ~source_impl() = default;
-
-  virtual optional<O> pull() = 0;
-  virtual void pull_ready(future_action<O> callback) = 0;
-};
-
-#if 0
 template <typename C>
 void connect(std::shared_ptr<source_impl<C>> so,
              std::shared_ptr<sink_impl<C>> si) {
@@ -210,69 +267,6 @@ void connect(std::shared_ptr<source_impl<C>> so,
   });
 }
 
-template <typename T>
-class buffered_channel {
- public:
-  buffered_channel() = default;
-
-  optional<T> pull() {
-    auto s = queue_.pull();
-    switch (s.contents) {
-      case future_contents::kHasValue:
-        return std::move(s.value);
-      case future_contents::kHasException:
-        std::rethrow_exception(s.exception);
-      case future_contents::kDrain:
-        return {};
-    }
-  }
-
-  void push(T value) {
-    queue_.push(future_state<T>{future_contents::kHasValue, std::move(value)});
-  }
-
-  void shutdown() { queue_.shutdown(); }
-
-  future<queue_state> push_ready() { return {}; }
-  future<void> pull_ready() { return {}; }
-
-  class source : public source_impl<T> {
-   public:
-    source(std::shared_ptr<buffered_channel> channel)
-        : channel_(std::move(channel)) {}
-
-    optional<T> pull() override { return channel_->pull(); }
-    future<void> pull_ready() override { return channel_->pull_ready(); }
-
-   private:
-    std::shared_ptr<buffered_channel> channel_;
-  };
-
-  class sink : public sink_impl<T> {
-   public:
-    sink(std::shared_ptr<buffered_channel> channel)
-        : channel_(std::move(channel)) {}
-
-    void push(T value) override { channel_->push(std::move(value)); }
-    future<void> push_ready() override { return channel_->push_ready(); }
-
-   private:
-    std::shared_ptr<buffered_channel> channel_;
-  };
-
- private:
-  future_queue<T> queue_;
-  future_queue<void> push_ready_;
-};
-
-template <typename T>
-std::pair<std::shared_ptr<sink_impl<T>>, std::shared_ptr<source_impl<T>>>
-make_buffered_channel_impl() {
-  auto channel = std::make_shared<buffered_channel<T>>();
-  return {std::make_shared<buffered_channel<T>::sink>(channel),
-          std::make_shared<buffered_channel<T>::source>(channel)};
-}
-#endif  // 0
 }  // namespace internal
 
 #if 0
