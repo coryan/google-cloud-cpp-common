@@ -23,6 +23,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(GOOGLE_CLOUD_CPP_ROOT "${PROJECT_SOURCE_DIR}/..")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}")
 
+include(external/abseil)
 include(external/grpc)
 include(external/googleapis)
 include(external/googletest)
@@ -31,8 +32,8 @@ include(ExternalProjectHelper)
 set_external_project_build_parallel_level(PARALLEL)
 set_external_project_vars()
 
-set(GOOGLE_CLOUD_CPP_DEPENDENCIES_LIST grpc-project googleapis-project
-                                       googletest-project)
+set(GOOGLE_CLOUD_CPP_DEPENDENCIES_LIST grpc_project googleapis-project
+                                       googletest-project abseil-cpp-project)
 
 include(ExternalProject)
 ExternalProject_Add(

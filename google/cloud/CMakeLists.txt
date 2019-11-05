@@ -57,6 +57,8 @@ include(GoogleCloudCppCommon)
 add_library(google_cloud_cpp_common_options INTERFACE)
 google_cloud_cpp_add_common_options(google_cloud_cpp_common_options)
 
+find_package(absl)
+
 # Define a function to fetch the current git revision. Using a function creates
 # a new scope, so the CMake variables do not leak to the global namespace.
 function (google_cloud_cpp_initialize_git_head var)
@@ -173,7 +175,7 @@ add_library(
     version.h)
 target_link_libraries(
     google_cloud_cpp_common
-    PUBLIC Threads::Threads
+    PUBLIC absl::variant Threads::Threads
     PRIVATE google_cloud_cpp_common_options)
 target_include_directories(
     google_cloud_cpp_common
@@ -206,6 +208,7 @@ add_subdirectory(testing_util)
 
 if (BUILD_TESTING)
     set(google_cloud_cpp_common_unit_tests
+        absl_link_test.cc
         future_generic_test.cc
         future_generic_then_test.cc
         future_void_test.cc
