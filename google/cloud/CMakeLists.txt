@@ -47,6 +47,8 @@ set(DOXYGEN_EXCLUDE_SYMBOL "internal")
 
 include(GoogleCloudCppCommon)
 
+find_package(absl)
+
 # Define an interface library, i.e., a library that really has no sources, and
 # add public target options to it.  The targets then use the library via
 # target_link_libraries(target PRIVATE bigtable_common_options), which
@@ -173,7 +175,7 @@ add_library(
     version.h channel.cc channel.h)
 target_link_libraries(
     google_cloud_cpp_common
-    PUBLIC Threads::Threads
+    PUBLIC absl::variant Threads::Threads
     PRIVATE google_cloud_cpp_common_options)
 target_include_directories(
     google_cloud_cpp_common

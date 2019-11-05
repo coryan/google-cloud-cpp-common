@@ -26,11 +26,14 @@ using ::testing::ElementsAre;
 
 TEST(FutureQueueTest, Basic) {
   future_queue<std::string> tested;
-  tested.push(future_state<std::string>{future_contents::kHasValue, "foo", {}});
-  tested.push(future_state<std::string>{future_contents::kHasValue, "bar", {}});
-  tested.push(future_state<std::string>{future_contents::kHasValue, "baz", {}});
+  tested.push(future_state<std::string>{"foo"});
+  tested.push(future_state<std::string>{"bar"});
+  tested.push(future_state<std::string>{"baz"});
   std::vector<std::string> actual{
-      *tested.pull().value, *tested.pull().value, *tested.pull().value};
+      absl::get<std::string>(tested.pull()),
+      absl::get<std::string>(tested.pull()),
+      absl::get<std::string>(tested.pull()),
+  };
   EXPECT_THAT(actual, ElementsAre("foo", "bar", "baz"));
 }
 

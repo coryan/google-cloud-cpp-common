@@ -18,6 +18,7 @@
 #include "google/cloud/future.h"
 #include "google/cloud/internal/invoke_result.h"
 #include "google/cloud/optional.h"
+#include <absl/types/variant.h>
 #include <deque>
 #include <limits>
 
@@ -40,16 +41,13 @@ enum class future_contents {
 };
 
 template <typename T>
-struct future_state {
-  future_contents contents;
-  optional<T> value;
-  std::exception_ptr exception;
+struct future_state : absl::variant<absl::monostate, std::exception_ptr, T> {
+  using absl::variant<absl::monostate, std::exception_ptr, T>::variant;
 };
 
 template <>
-struct future_state<void> {
-  future_contents contents;
-  std::exception_ptr exception;
+struct future_state<void> : absl::variant<absl::monostate, std::exception_ptr> {
+  using absl::variant<absl::monostate, std::exception_ptr>::variant;
 };
 
 template <typename T>
