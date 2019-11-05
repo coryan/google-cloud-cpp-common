@@ -37,6 +37,17 @@ def google_cloud_cpp_common_deps():
             sha256 = "d21d38c4b8e81eed8fa95ede48dd69aba01a3b938be6ac03d2b9dc61886a7183",
         )
 
+    # Load Abseil - C++ Common Libraries
+    if "com_google_absl" not in native.existing_rules():
+        http_archive(
+            name = "com_google_absl",
+            strip_prefix = "abseil-cpp-20190808",
+            urls = [
+                "https://github.com/abseil/abseil-cpp/archive/20190808.tar.gz",
+            ],
+            sha256 = "8100085dada279bf3ee00cd064d43b5f55e5d913be0dfe2906f06f8f28d5b37e",
+        )
+
     # Load a version of googletest that we know works.
     if "com_google_googletest" not in native.existing_rules():
         http_archive(

@@ -26,6 +26,7 @@ declare -A ORIGINAL_COPYRIGHT_YEAR=(
 )
 
 BUILD_AND_TEST_PROJECT_FRAGMENT=$(replace_fragments \
+      "INSTALL_ABSEIL_CPP_FROM_SOURCE" \
       "INSTALL_CPP_CMAKEFILES_FROM_SOURCE" \
       "INSTALL_GOOGLETEST_FROM_SOURCE" <<'_EOF_'
 # #### googleapis
@@ -43,6 +44,15 @@ BUILD_AND_TEST_PROJECT_FRAGMENT=$(replace_fragments \
 
 # ```bash
 @INSTALL_GOOGLETEST_FROM_SOURCE@
+# ```
+
+# #### Abseil C++
+
+# We need a recent version of the Abseil C++ libraries, these are installed from
+# source using:
+
+# ```bash
+@INSTALL_ABSEIL_CPP_FROM_SOURCE@
 # ```
 
 FROM devtools AS install

@@ -21,6 +21,17 @@ read_into_variable WARNING_GENERATED_FILE_FRAGMENT <<'_EOF_'
 #
 _EOF_
 
+read_into_variable INSTALL_ABSEIL_CPP_FROM_SOURCE <<'_EOF_'
+WORKDIR /var/tmp/build
+RUN wget -q https://github.com/abseil/abseil-cpp/archive/20190808.tar.gz && \
+    tar -xf 20190808.tar.gz && \
+    cd abseil-cpp-20190808 && \
+    cmake -DCMAKE_BUILD_TYPE="Release" -DBUILD_SHARED_LIBS=yes -H. -Bcmake-out && \
+    cmake --build cmake-out -- -j ${NCPU:-4} && \
+    cmake --build cmake-out --target install -- -j ${NCPU:-4} && \
+    ldconfig
+_EOF_
+
 read_into_variable INSTALL_CPP_CMAKEFILES_FROM_SOURCE <<'_EOF_'
 WORKDIR /var/tmp/build
 RUN wget -q https://github.com/googleapis/cpp-cmakefiles/archive/v0.1.5.tar.gz && \
