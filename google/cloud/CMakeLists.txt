@@ -172,7 +172,9 @@ add_library(
     terminate_handler.cc
     terminate_handler.h
     version.cc
-    version.h channel.cc channel.h)
+    version.h
+    channel.cc
+    channel.h)
 target_link_libraries(
     google_cloud_cpp_common
     PUBLIC absl::variant Threads::Threads

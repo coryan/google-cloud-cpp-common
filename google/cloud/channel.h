@@ -25,7 +25,6 @@
 namespace google {
 namespace cloud {
 inline namespace GOOGLE_CLOUD_CPP_NS {
-
 namespace internal {
 
 enum class queue_state {
@@ -53,6 +52,7 @@ struct future_state<void> : absl::variant<absl::monostate, std::exception_ptr> {
 template <typename T>
 using future_action = std::function<void(future_state<T>)>;
 
+// A queue with lwm and hwm for capacity.
 template <typename T>
 class future_queue {
  public:
