@@ -20,9 +20,9 @@ if (NOT TARGET abseil-cpp-project)
     # Give application developers a hook to configure the version and hash
     # downloaded from GitHub.
     set(GOOGLE_CLOUD_CPP_ABSEIL_CPP_URL
-        "https://github.com/abseil/abseil-cpp/archive/20190808.tar.gz")
+        "https://github.com/abseil/abseil-cpp/archive/85092b4b648ca729c6263c4a302a41dfff28705e.tar.gz")
     set(GOOGLE_CLOUD_CPP_ABSEIL_CPP_SHA256
-        "8100085dada279bf3ee00cd064d43b5f55e5d913be0dfe2906f06f8f28d5b37e")
+        "0db540c67e9da547c48b18087c28d95ae4798721a67e0a001f9ce905be3df918")
 
     set_external_project_build_parallel_level(PARALLEL)
 
@@ -43,6 +43,7 @@ if (NOT TARGET abseil-cpp-project)
                    -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
                    -DBUILD_SHARED_LIBS=${BUILD_SHARED_LIBS}
                    -DCMAKE_PREFIX_PATH=${GOOGLE_CLOUD_CPP_PREFIX_PATH}
+                   -DCMAKE_INSTALL_RPATH=${GOOGLE_CLOUD_CPP_INSTALL_RPATH}
                    -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
         BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> ${PARALLEL}
         LOG_DOWNLOAD ON

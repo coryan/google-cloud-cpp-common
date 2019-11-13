@@ -154,9 +154,9 @@ RUN ldconfig
 
 # Install Abseil C++ libraries.
 WORKDIR /var/tmp/build
-RUN wget -q https://github.com/abseil/abseil-cpp/archive/20190808.tar.gz && \
-    tar -xf 20190808.tar.gz && \
-    cd abseil-cpp-20190808 && \
+RUN wget -q https://github.com/abseil/abseil-cpp/archive/master.tar.gz && \
+    tar -xf master.tar.gz && \
+    cd abseil-cpp-master && \
     cmake -DCMAKE_BUILD_TYPE="Release" -DBUILD_SHARED_LIBS=yes -H. -Bcmake-out && \
     cmake --build cmake-out -- -j ${NCPU:-4} && \
     cmake --build cmake-out --target install -- -j ${NCPU:-4} && \
