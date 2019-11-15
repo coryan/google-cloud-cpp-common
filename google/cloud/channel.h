@@ -67,9 +67,11 @@ class simple_channel {
     }
   }
 
-  T pull() {
+  optional<T> pull() {
     std::unique_lock<std::mutex> lk(mu_);
-    pull_wait_.wait(lk, [this] { return !buffer_.empty(); });
+    pull_wait_.wait(lk, [this] {
+      return !buffer_.empty() || state_ == channel_state::kShutdown;
+    });
     auto value = pop(lk);
     lk.unlock();
     return value;
@@ -97,7 +99,8 @@ class simple_channel {
     if (!buffer_.empty()) {
       auto value = pop(lk);
       lk.unlock();
-      invoke_has_data_handler(std::move(h), std::move(value));
+      if (value.has_value()) return;
+      invoke_has_data_handler(std::move(h), *std::move(value));
       return;
     }
     on_has_data_.push_back(std::move(h));
@@ -130,10 +133,16 @@ class simple_channel {
     std::shared_ptr<simple_channel> channel_;
   };
 
-  using endpoints = std::pair<sink, source>;
+  struct endpoints {
+    sink tx;
+    source rx;
+  };
 
  private:
-  T pop(std::unique_lock<std::mutex>&) {
+  optional<T> pop(std::unique_lock<std::mutex>&) {
+    if (state_ == channel_state::kShutdown) {
+      return {};
+    }
     auto value = std::move(buffer_.front());
     buffer_.pop_front();
     if (state_ == channel_state::kDraining && buffer_.size() < lwm_) {
@@ -234,157 +243,66 @@ struct is_source
 
 }  // namespace concepts
 
-#if 0
-// A queue with lwm and hwm for capacity.
-template <typename T>
-class flow_controlled_channel {
+template <typename T, typename Source>
+class flow_control_junction {
  public:
-  flow_controlled_channel() = default;
+  using capacity_channel = simple_channel<bool>;
+  using capacity_sink = typename simple_channel<bool>::sink;
+  using capacity_source = typename simple_channel<bool>::source;
 
-  void shutdown() {
-    std::unique_lock<std::mutex> lk(mu_);
-    if (state_ != channel_state::kAccepting) {
-      // Already draining or shutdown.
-      return;
-    }
-    state_ = buffer_.empty() ? channel_state::kShutdown : channel_state::kDraining;
-    while (!on_has_data_.empty()) {
-      auto action = std::move(on_has_data_.front());
-      on_has_data_.pop_front();
-      lk.unlock();
-      action(future_state<T>{});
-      lk.lock();
-    }
+  flow_control_junction(Source source, capacity_sink capacity)
+      : source_(std::move(source)), capacity_(std::move(capacity)) {
+    static_assert(
+        concepts::is_source<Source, T>::value,
+        "The Source template parameter should meet is_source<Source, T>");
+    static_assert(concepts::is_source<flow_control_junction, T>::value,
+                  "flow_control_junction should meet "
+                  "is_source<flow_control_junction, T>");
   }
 
-  future_state<T> pull() {
-    std::unique_lock<std::mutex> lk(mu_);
-    pull_wait_.wait(lk, [this] { return !buffer_.empty(); });
-    auto value = pop(lk);
-    lk.unlock();
-    return value;
+  optional<T> pull() {
+    auto value = source_.pull();
+    capacity_.push(true);
+    return std::move(value);
   }
 
-  void push(future_state<T> value) {
-    std::unique_lock<std::mutex> lk(mu_);
-    if (state_ != channel_state::kAccepting) {
-      return;
-    }
-    if (on_has_data_.empty()) {
-      push_wait_.wait(lk, [this] { return buffer_.size() < hwm_; });
-      buffer_.push_back(std::move(value));
-      pull_wait_.notify_all();
-      return;
-    }
-    auto action = std::move(on_has_data_.front());
-    on_has_data_.pop_front();
-    lk.unlock();
-    invoke_has_data_handler(std::move(action), std::move(value));
-  }
+  template <typename Handler>
+  void on_data(Handler handler) {
+    struct Wrapper {
+      flow_control_junction* self;
+      typename std::decay<Handler>::type handler;
 
-  void on_has_data(on_data_handler<T> h) {
-    std::unique_lock<std::mutex> lk(mu_);
-    if (!buffer_.empty()) {
-      auto value = pop(lk);
-      lk.unlock();
-      invoke_has_data_handler(std::move(h), std::move(value));
-      return;
-    }
-    on_has_data_.push_back(std::move(h));
-  }
-
-  void on_has_capacity(on_capacity_handler h) {
-    std::unique_lock<std::mutex> lk(mu_);
-    if (state_ == channel_state::kAccepting) {
-      lk.unlock();
-      invoke_has_capacity_handler(h, channel_state::kAccepting);
-      return;
-    }
-    on_has_capacity_.push_back(std::move(h));
-  }
-
-  class source : public source_impl<T> {
-   public:
-    explicit source(std::shared_ptr<flow_controlled_channel> channel)
-        : channel_(std::move(channel)) {}
-
-    optional<T> pull() override {
-      auto value = channel_->pull();
-      switch (value.index()) {
-        case 0:
-          return {};
-        case 1:
-          std::rethrow_exception(absl::get<std::exception_ptr>(value));
-        case 2:
-          return absl::get<T>(value);
-        default:
-          break;
+      on_data_resolution operator()(T value) {
+        auto r = handler(std::move(value));
+        self->capacity_.push(true);
+        return r;
       }
-      throw std::future_error(std::future_errc::no_state);
-    }
-
-    void on_has_data(on_data_handler<T> handler) override {
-      channel_->on_has_data(std::move(handler));
-    }
-
-   private:
-    std::shared_ptr<flow_controlled_channel> channel_;
-  };
-
-  class sink : public sink_impl<T> {
-   public:
-    explicit sink(std::shared_ptr<flow_controlled_channel> channel)
-        : channel_(std::move(channel)) {}
-
-    void push(T value) override { channel_->push(std::move(value)); }
-    void push_exception(std::exception_ptr ex) override {
-      channel_->push(std::move(ex));
-    }
-    void on_has_capacity(on_capacity_handler h) override {
-      channel_->on_has_capacity(std::move(h));
-    }
-    void shutdown() override { channel_->shutdown(); }
-
-   private:
-    std::shared_ptr<flow_controlled_channel> channel_;
-  };
+    };
+    source_.on_data(Wrapper{this, std::forward<Handler>(handler)});
+  }
 
  private:
-  future_state<T> pop(std::unique_lock<std::mutex>&) {
-    auto value = std::move(buffer_.front());
-    buffer_.pop_front();
-    if (state_ == channel_state::kDraining && buffer_.size() < lwm_) {
-      state_ = channel_state::kAccepting;
-      push_wait_.notify_all();
-    }
-    return value;
-  }
-
-  void invoke_has_data_handler(on_data_handler<T> handler,
-                               future_state<T> value) {
-    auto resolution = handler(std::move(value));
-    if (resolution == kDone) {
-      return;
-    }
-    on_has_data(std::move(handler));
-  }
-
-  void invoke_has_capacity_handler(on_capacity_handler const& handler,
-                                   channel_state state) {
-    handler(state);
-  }
-
-  std::mutex mu_;
-  std::condition_variable push_wait_;
-  std::condition_variable pull_wait_;
-  std::deque<future_state<T>> buffer_;
-  std::size_t hwm_ = std::numeric_limits<std::size_t>::max();
-  std::size_t lwm_ = std::numeric_limits<std::size_t>::max() - 1;
-  channel_state state_ = channel_state::kAccepting;
-  std::deque<on_data_handler<T>> on_has_data_;
-  std::deque<on_capacity_handler> on_has_capacity_;
+  Source source_;
+  capacity_sink capacity_;
 };
-#endif
+
+template <typename T, typename Source, typename Sink>
+struct flow_control_endpoints {
+  Sink tx;
+  flow_control_junction<T, Source> rx;
+  typename flow_control_junction<T, Source>::capacity_source capacity;
+};
+
+template <typename T, typename Source, typename Sink>
+flow_control_endpoints<T, Source, Sink> flow_control_impl(
+    Source source, Sink sink, std::size_t capacity) {
+  // TODO(coryan) - use a semaphore-like object ...
+  auto cap_endpoints = make_simple_channel_impl<bool>(capacity, 2 * capacity);
+
+  flow_control_junction<T, Source> junction(std::move(source),
+                                            std::move(cap_endpoints.tx));
+  return {std::move(sink), std::move(junction), std::move(cap_endpoints.rx)};
+}
 
 template <typename T>
 struct future_state : absl::variant<absl::monostate, std::exception_ptr, T> {

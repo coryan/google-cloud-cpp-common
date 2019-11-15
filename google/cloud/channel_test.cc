@@ -56,8 +56,8 @@ TEST(FutureQueueTest, MakeBufferedChannel) {
 
 TEST(FutureQueueTest, MakeSimpleChannel) {
   auto endpoints = make_simple_channel_impl<std::string>();
-  auto tx = std::move(endpoints.first);
-  auto rx = std::move(endpoints.second);
+  auto tx = std::move(endpoints.tx);
+  auto rx = std::move(endpoints.rx);
 
   tx.push("foo");
   tx.push("bar");
