@@ -78,7 +78,12 @@ TEST(FutureQueueTest, SimpleChannelTraits) {
                 "requirements");
 
   static_assert(
-      internal::concepts::is_source<tested::source, int>::value,
+      !internal::concepts::is_source<tested::sink>::value,
+      "A simple_channel<int>::sink should *NOT* meet the is_source<S,int> "
+      "requirements");
+
+  static_assert(
+      internal::concepts::is_source<tested::source>::value,
       "A simple_channel<int>::source should meet the is_source<S,int> "
       "requirements");
 }
@@ -95,8 +100,26 @@ TEST(FutureQueueTest, GeneratorBasic) {
   });
   EXPECT_THAT(actual, ElementsAre(42, 42, 42));
 
-  static_assert(internal::concepts::is_source<decltype(tested), int>::value,
-                "The result of generator( should meet the is_source<S,int> "
+  static_assert(internal::concepts::is_source<decltype(tested)>::value,
+                "The result of generator() should meet the is_source<S> "
+                "requirements");
+}
+
+TEST(FutureQueueTest, Transform) {
+  int count = 0;
+  auto gen = internal::generator([&count]() { return ++count; });
+
+  auto tested = gen >>= [](int x) { return std::to_string(x); };
+  std::vector<std::string> actual;
+  tested.on_data([&actual](std::string v) {
+    actual.push_back(std::move(v));
+    return actual.size() < 3 ? internal::on_data_resolution::kReschedule
+                             : internal::on_data_resolution::kDone;
+  });
+  EXPECT_THAT(actual, ElementsAre("1", "2", "3"));
+
+  static_assert(internal::concepts::is_source<decltype(gen)>::value,
+                "The result of generator( should meet the is_source<S> "
                 "requirements");
 }
 

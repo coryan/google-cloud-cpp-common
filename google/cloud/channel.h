@@ -38,6 +38,97 @@ enum on_data_resolution {
   kReschedule,
 };
 
+namespace concepts {
+template <typename>
+struct sfinae_true : public std::true_type {};
+
+template <typename Sink, typename T>
+struct has_push_impl {
+  static auto test(int)
+      -> sfinae_true<decltype(std::declval<Sink>().push(std::declval<T>()))>;
+  static auto test(long) -> std::false_type;
+};
+
+template <typename Sink, typename T>
+struct has_shutdown_impl {
+  static auto test(int)
+      -> sfinae_true<decltype(std::declval<Sink>().shutdown())>;
+  static auto test(long) -> std::false_type;
+};
+
+template <typename Sink, typename T>
+struct has_push : decltype(has_push_impl<Sink, T>::test(0)) {};
+
+template <typename Sink, typename T>
+struct has_shutdown : decltype(has_push_impl<Sink, T>::test(0)) {};
+
+template <typename Sink, typename T>
+struct is_sink : absl::conjunction<has_push<Sink, T>, has_shutdown<Sink, T>> {};
+
+template <typename Source, typename T>
+struct has_pull_impl {
+  static auto test(int) -> sfinae_true<decltype(std::declval<Source>().pull())>;
+  static auto test(long) -> std::false_type;
+};
+template <typename Source, typename T>
+struct has_pull : decltype(has_pull_impl<Source, T>::test(0)) {};
+
+template <typename Source, typename T>
+struct has_on_data_impl {
+  struct handler {
+    on_data_resolution operator()(T) { return on_data_resolution::kDone; }
+  };
+  static auto test(int)
+      -> sfinae_true<decltype(std::declval<Source>().on_data(handler{}))>;
+  static auto test(long) -> std::false_type;
+};
+template <typename Source, typename T>
+struct has_on_data : decltype(has_on_data_impl<Source, T>::test(0)) {};
+
+template <typename Source, class U = void>
+struct has_event_type : public std::false_type {};
+
+template <typename Source>
+struct has_event_type<Source, void_t<typename Source::event_type>>
+    : public std::true_type {};
+
+struct do_not_use {};
+
+template <typename Source, class U = void>
+struct source_event_type {
+  using type = do_not_use;
+};
+
+template <typename Source>
+struct source_event_type<Source, void_t<typename Source::event_type>> {
+  using type = typename Source::event_type;
+};
+
+template <typename Source>
+using source_event_t = typename source_event_type<Source>::type;
+
+template <typename Source, class U = void>
+struct pull_result_type {
+  using type = do_not_use;
+};
+template <typename Source>
+struct pull_result_type<Source, void_t<decltype(&Source::pull)>> {
+  using type = invoke_result_t<decltype(&Source::pull), Source>;
+};
+
+template <typename Source>
+using source_pull_result_t = typename pull_result_type<Source>::type;
+
+template <typename Source>
+struct is_source
+    : absl::conjunction<has_event_type<Source>,
+                        has_pull<Source, source_event_t<Source>>,
+                        std::is_same<optional<source_event_t<Source>>,
+                                     source_pull_result_t<Source>>,
+                        has_on_data<Source, source_event_t<Source>>> {};
+
+}  // namespace concepts
+
 /**
  * A thread-safe queue with high and low watermarks to control flow.
  */
@@ -108,6 +199,7 @@ class simple_channel {
 
   class source {
    public:
+    using event_type = T;
     explicit source(std::shared_ptr<simple_channel> channel)
         : channel_(std::move(channel)) {}
 
@@ -186,63 +278,6 @@ typename simple_channel<T>::endpoints make_simple_channel_impl(
           typename simple_channel<T>::source(channel)};
 }
 
-namespace concepts {
-template <typename>
-struct sfinae_true : public std::true_type {};
-
-template <typename Sink, typename T>
-struct has_push_impl {
-  static auto test(int)
-      -> sfinae_true<decltype(std::declval<Sink>().push(std::declval<T>()))>;
-  static auto test(long) -> std::false_type;
-};
-
-template <typename Sink, typename T>
-struct has_shutdown_impl {
-  static auto test(int)
-      -> sfinae_true<decltype(std::declval<Sink>().shutdown())>;
-  static auto test(long) -> std::false_type;
-};
-
-template <typename Sink, typename T>
-struct has_push : decltype(has_push_impl<Sink, T>::test(0)) {};
-
-template <typename Sink, typename T>
-struct has_shutdown : decltype(has_push_impl<Sink, T>::test(0)) {};
-
-template <typename Sink, typename T>
-struct is_sink : absl::conjunction<has_push<Sink, T>, has_shutdown<Sink, T>> {};
-
-template <typename Source, typename T>
-struct has_pull_impl {
-  static auto test(int) -> sfinae_true<decltype(std::declval<Source>().pull())>;
-  static auto test(long) -> std::false_type;
-};
-template <typename Source, typename T>
-struct has_pull : decltype(has_pull_impl<Source, T>::test(0)) {};
-
-template <typename Source, typename T>
-struct has_on_data_impl {
-  struct handler {
-    on_data_resolution operator()(T) { return on_data_resolution::kDone; }
-  };
-  static auto test(int)
-      -> sfinae_true<decltype(std::declval<Source>().on_data(handler{}))>;
-  static auto test(long) -> std::false_type;
-};
-template <typename Source, typename T>
-struct has_on_data : decltype(has_on_data_impl<Source, T>::test(0)) {};
-
-template <typename Source, typename T>
-struct is_source
-    : absl::conjunction<
-          has_pull<Source, T>,
-          std::is_same<optional<T>,
-                       invoke_result_t<decltype(&Source::pull), Source>>,
-          has_on_data<Source, T>> {};
-
-}  // namespace concepts
-
 template <typename T, typename Source>
 class flow_control_junction {
  public:
@@ -253,9 +288,9 @@ class flow_control_junction {
   flow_control_junction(Source source, capacity_sink capacity)
       : source_(std::move(source)), capacity_(std::move(capacity)) {
     static_assert(
-        concepts::is_source<Source, T>::value,
+        concepts::is_source<Source>::value,
         "The Source template parameter should meet is_source<Source, T>");
-    static_assert(concepts::is_source<flow_control_junction, T>::value,
+    static_assert(concepts::is_source<flow_control_junction>::value,
                   "flow_control_junction should meet "
                   "is_source<flow_control_junction, T>");
   }
@@ -307,7 +342,9 @@ flow_control_endpoints<T, Source, Sink> flow_control_impl(
 template <typename Callable, typename T = invoke_result_t<Callable>>
 class generator_source {
  public:
-  explicit generator_source(Callable callable)
+  using event_type = T;
+
+  explicit generator_source(Callable&& callable)
       : callable_(std::move(callable)) {}
 
   optional<T> pull() { return callable_(); }
@@ -323,11 +360,52 @@ class generator_source {
   Callable callable_;
 };
 
+template <typename T>
+using decay_t = typename std::decay<T>::type;
+
 template <typename Callable>
-generator_source<typename std::decay<Callable>::type> generator(
-    Callable callable) {
-  return generator_source<typename std::decay<Callable>::type>(
-      std::forward<Callable>(callable));
+generator_source<decay_t<Callable>> generator(Callable&& callable) {
+  return generator_source<decay_t<Callable>>(std::forward<Callable>(callable));
+}
+
+template <typename Source, typename Pipeline>
+class transformed_source {
+ public:
+  using event_type = invoke_result_t<Pipeline, typename Source::event_type>;
+  transformed_source(Source source, Pipeline pipeline)
+      : source_(std::move(source)), pipeline_(std::move(pipeline)) {}
+
+  optional<event_type> pull() {
+    auto tmp = source_.pull();
+    if (!tmp) return {};
+    return pipeline_(*std::move(tmp));
+  }
+
+  template <typename Handler>
+  void on_data(Handler&& handler) {
+    struct Wrapper {
+      transformed_source* self;
+      decay_t<Handler> handler;
+
+      on_data_resolution operator()(typename Source::event_type x) {
+        return handler(self->pipeline_(std::move(x)));
+      }
+    };
+    source_.on_data(Wrapper{this, std::forward<Handler>(handler)});
+  }
+
+ private:
+  Source source_;
+  Pipeline pipeline_;
+};
+
+template <typename Source, typename Transform,
+          typename T = typename decay_t<Source>::event_type,
+          typename U = invoke_result_t<decay_t<Transform>, T>>
+transformed_source<decay_t<Source>, decay_t<Transform>> operator>>=(
+    Source&& source, Transform&& transform) {
+  return transformed_source<decay_t<Source>, decay_t<Transform>>(
+      std::forward<Source>(source), std::forward<Transform>(transform));
 }
 
 template <typename T>
