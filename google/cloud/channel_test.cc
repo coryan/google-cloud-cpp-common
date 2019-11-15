@@ -54,6 +54,35 @@ TEST(FutureQueueTest, MakeBufferedChannel) {
   EXPECT_THAT(actual, ElementsAre("foo", "bar", "baz"));
 }
 
+TEST(FutureQueueTest, MakeSimpleChannel) {
+  auto endpoints = make_simple_channel_impl<std::string>();
+  auto tx = std::move(endpoints.first);
+  auto rx = std::move(endpoints.second);
+
+  tx.push("foo");
+  tx.push("bar");
+  tx.push("baz");
+
+  std::vector<std::string> actual{
+      *rx.pull(),
+      *rx.pull(),
+      *rx.pull(),
+  };
+  EXPECT_THAT(actual, ElementsAre("foo", "bar", "baz"));
+}
+
+TEST(FutureQueueTest, SimpleChannelTraits) {
+  using tested = internal::simple_channel<int>;
+  static_assert(internal::concepts::is_sink<tested::sink, int>::value,
+                "A simple_channel<int>::sink should meet the is_sink<S,int> "
+                "requirements");
+
+  static_assert(
+      internal::concepts::is_source<tested::source, int>::value,
+      "A simple_channel<int>::source should meet the is_source<S,int> "
+      "requirements");
+}
+
 }  // namespace
 }  // namespace internal
 }  // namespace GOOGLE_CLOUD_CPP_NS
