@@ -304,6 +304,32 @@ flow_control_endpoints<T, Source, Sink> flow_control_impl(
   return {std::move(sink), std::move(junction), std::move(cap_endpoints.rx)};
 }
 
+template <typename Callable, typename T = invoke_result_t<Callable>>
+class generator_source {
+ public:
+  explicit generator_source(Callable callable)
+      : callable_(std::move(callable)) {}
+
+  optional<T> pull() { return callable_(); }
+
+  template <typename Handler>
+  void on_data(Handler handler) {
+    for (auto r = handler(callable_()); r == on_data_resolution::kReschedule;
+         r = handler(callable_())) {
+    }
+  }
+
+ private:
+  Callable callable_;
+};
+
+template <typename Callable>
+generator_source<typename std::decay<Callable>::type> generator(
+    Callable callable) {
+  return generator_source<typename std::decay<Callable>::type>(
+      std::forward<Callable>(callable));
+}
+
 template <typename T>
 struct future_state : absl::variant<absl::monostate, std::exception_ptr, T> {
   using absl::variant<absl::monostate, std::exception_ptr, T>::variant;

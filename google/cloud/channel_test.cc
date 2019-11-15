@@ -83,6 +83,23 @@ TEST(FutureQueueTest, SimpleChannelTraits) {
       "requirements");
 }
 
+TEST(FutureQueueTest, GeneratorBasic) {
+  auto tested = internal::generator([]() -> int { return 42; });
+  EXPECT_EQ(42, *tested.pull());
+
+  std::vector<int> actual;
+  tested.on_data([&actual](int v) {
+    actual.push_back(v);
+    return actual.size() < 3 ? internal::on_data_resolution::kReschedule
+                             : internal::on_data_resolution::kDone;
+  });
+  EXPECT_THAT(actual, ElementsAre(42, 42, 42));
+
+  static_assert(internal::concepts::is_source<decltype(tested), int>::value,
+                "The result of generator( should meet the is_source<S,int> "
+                "requirements");
+}
+
 }  // namespace
 }  // namespace internal
 }  // namespace GOOGLE_CLOUD_CPP_NS
