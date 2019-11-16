@@ -25,8 +25,7 @@ if (NOT TARGET abseil-cpp-project)
         "8100085dada279bf3ee00cd064d43b5f55e5d913be0dfe2906f06f8f28d5b37e")
 
     set_external_project_build_parallel_level(PARALLEL)
-
-    set_external_project_prefix_vars()
+    set_external_project_vars()
 
     include(ExternalProject)
     ExternalProject_Add(
