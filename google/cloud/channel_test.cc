@@ -108,15 +108,15 @@ TEST(FutureQueueTest, GeneratorBasic) {
 TEST(FutureQueueTest, Transform) {
   int count = 0;
   auto gen = internal::generator([&count]() { return ++count; });
-
-  auto tested = gen >>= [](int x) { return std::to_string(x); };
+  auto tested = gen >> [](int x) { return 2 * x; } >>
+                [](int x) { return std::to_string(x); };
   std::vector<std::string> actual;
   tested.on_data([&actual](std::string v) {
     actual.push_back(std::move(v));
     return actual.size() < 3 ? internal::on_data_resolution::kReschedule
                              : internal::on_data_resolution::kDone;
   });
-  EXPECT_THAT(actual, ElementsAre("1", "2", "3"));
+  EXPECT_THAT(actual, ElementsAre("2", "4", "6"));
 
   static_assert(internal::concepts::is_source<decltype(gen)>::value,
                 "The result of generator( should meet the is_source<S> "

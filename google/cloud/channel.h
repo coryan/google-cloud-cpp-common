@@ -365,6 +365,9 @@ using decay_t = typename std::decay<T>::type;
 
 template <typename Callable>
 generator_source<decay_t<Callable>> generator(Callable&& callable) {
+  static_assert(
+      concepts::is_source<generator_source<decay_t<Callable>>>::value,
+      "generator_source<> should meet concepts::is_source<> requirements");
   return generator_source<decay_t<Callable>>(std::forward<Callable>(callable));
 }
 
@@ -400,9 +403,11 @@ class transformed_source {
 };
 
 template <typename Source, typename Transform,
-          typename T = typename decay_t<Source>::event_type,
+          typename std::enable_if<concepts::is_source<decay_t<Source>>::value,
+                                  int>::type = 0,
+          typename T = concepts::source_event_t<decay_t<Source>>,
           typename U = invoke_result_t<decay_t<Transform>, T>>
-transformed_source<decay_t<Source>, decay_t<Transform>> operator>>=(
+transformed_source<decay_t<Source>, decay_t<Transform>> operator>>(
     Source&& source, Transform&& transform) {
   return transformed_source<decay_t<Source>, decay_t<Transform>>(
       std::forward<Source>(source), std::forward<Transform>(transform));
