@@ -24,7 +24,7 @@ namespace {
 
 using ::testing::ElementsAre;
 
-TEST(FutureQueueTest, MakeSimpleChannel) {
+TEST(ChannelTest, MakeSimpleChannel) {
   auto endpoints = make_simple_channel_impl<std::string>();
   auto tx = std::move(endpoints.tx);
   auto rx = std::move(endpoints.rx);
@@ -41,7 +41,7 @@ TEST(FutureQueueTest, MakeSimpleChannel) {
   EXPECT_THAT(actual, ElementsAre("foo", "bar", "baz"));
 }
 
-TEST(FutureQueueTest, SimpleChannelTraits) {
+TEST(ChannelTest, SimpleChannelTraits) {
   using tested = internal::simple_channel<int>;
   static_assert(internal::concepts::is_sink<tested::sink, int>::value,
                 "A simple_channel<int>::sink should meet the is_sink<S,int> "
@@ -58,7 +58,7 @@ TEST(FutureQueueTest, SimpleChannelTraits) {
       "requirements");
 }
 
-TEST(FutureQueueTest, GeneratorBasic) {
+TEST(ChannelTest, GeneratorBasic) {
   auto tested = internal::generator([]() -> int { return 42; });
   EXPECT_EQ(42, *tested.pull());
 
@@ -75,7 +75,7 @@ TEST(FutureQueueTest, GeneratorBasic) {
                 "requirements");
 }
 
-TEST(FutureQueueTest, Transform) {
+TEST(ChannelTest, Transform) {
   int count = 0;
   auto gen = internal::generator([&count]() { return ++count; });
   auto tested = gen >> [](int x) { return 2 * x; } >>
@@ -93,7 +93,8 @@ TEST(FutureQueueTest, Transform) {
                 "requirements");
 }
 
-TEST(FutureQueueTest, Goal) {
+#if 0
+TEST(ChannelTest, Goal) {
   ASSERT_TRUE(false) << "Code not ready yet";
   // Create a channel that can hold up to 10 elements, and does not restart
   // sending until it holds less than 5.
@@ -142,6 +143,7 @@ TEST(FutureQueueTest, Goal) {
                   [&count] { return std::to_string(2 * count++); });
   EXPECT_THAT(actual, ElementsAre("2", "4", "6"));
 }
+#endif
 
 }  // namespace
 }  // namespace internal
