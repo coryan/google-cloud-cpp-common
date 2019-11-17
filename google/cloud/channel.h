@@ -73,27 +73,38 @@ struct has_shutdown : has_shutdown_impl<Sink>::type {};
 template <typename Sink, typename T>
 struct is_sink : absl::conjunction<has_push<Sink, T>, has_shutdown<Sink>> {};
 
-template <typename Source, typename T>
+template <typename Source, typename T, typename AlwaysVoid = void>
 struct has_pull_impl {
-  static auto test(int) -> sfinae_true<decltype(std::declval<Source>().pull())>;
-  static auto test(long) -> std::false_type;
+  using type = std::false_type;
 };
 template <typename Source, typename T>
-struct has_pull : decltype(has_pull_impl<Source, T>::test(0)) {};
-
+struct has_pull_impl<Source, T,
+                     void_t<decltype(std::declval<Source>().pull())>> {
+  using type = std::true_type;
+};
 template <typename Source, typename T>
+struct has_pull : has_pull_impl<Source, T>::type {};
+
+template <typename Source, typename T, typename AlwaysVoid = void>
 struct has_on_data_impl {
-  struct handler {
-    on_data_resolution operator()(T) { return on_data_resolution::kDone; }
-  };
-  static auto test(int)
-      -> sfinae_true<decltype(std::declval<Source>().on_data(handler{}))>;
-  static auto test(long) -> std::false_type;
+  using type = std::false_type;
+};
+
+template <typename T>
+struct has_on_data_impl_handler {
+  on_data_resolution operator()(T) { return on_data_resolution::kDone; }
+};
+
+template <typename Source, typename T>
+struct has_on_data_impl<Source, T, void_t<decltype(
+    std::declval<Source>().on_data(has_on_data_impl_handler<T>{})
+    )>>  {
+  using type = std::true_type;
 };
 template <typename Source, typename T>
-struct has_on_data : decltype(has_on_data_impl<Source, T>::test(0)) {};
+struct has_on_data : has_on_data_impl<Source, T>::type {};
 
-template <typename Source, class U = void>
+template <typename Source, class AlwaysVoid = void>
 struct has_event_type : public std::false_type {};
 
 template <typename Source>

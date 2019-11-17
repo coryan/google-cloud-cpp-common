@@ -56,6 +56,68 @@ TEST(ChannelTest, ConceptsIsSink) {
   EXPECT_TRUE((concepts::is_sink<expect_true, int>::value));
 }
 
+TEST(ChannelTest, ConceptsHasPull) {
+  struct expect_false {};
+  struct expect_true {
+    void pull();
+  };
+  EXPECT_FALSE((concepts::has_pull<expect_false, int>::value));
+  EXPECT_TRUE((concepts::has_pull<expect_true, int>::value));
+}
+
+struct has_on_data_generic {
+  template <typename Functor>
+  void on_data(Functor&&) {}
+};
+
+TEST(ChannelTest, ConceptsOnData) {
+  struct expect_false {};
+  struct mismatched_type {
+    void on_data(int);
+  };
+  struct expect_true {
+    void on_data(std::function<void(int)>);
+  };
+  EXPECT_FALSE((concepts::has_on_data<expect_false, int>::value));
+  EXPECT_FALSE((concepts::has_on_data<mismatched_type, int>::value));
+  EXPECT_TRUE((concepts::has_on_data<expect_true, int>::value));
+  EXPECT_TRUE((concepts::has_on_data<has_on_data_generic, int>::value));
+}
+
+TEST(ChannelTest, ConceptsEventType) {
+  struct expect_false {};
+  struct expect_true {
+    using event_type = int;
+  };
+  EXPECT_FALSE((concepts::has_event_type<expect_false>::value));
+  EXPECT_TRUE((concepts::has_event_type<expect_true>::value));
+}
+
+TEST(ChannelTest, ConceptsIsSource) {
+  struct expect_false_0 {};
+  struct expect_false_1 {
+    optional<int> pull();
+  };
+  struct expect_false_2 {
+    void on_data(std::function<void(int)>);
+    optional<int> pull();
+  };
+  struct expect_false_3 {
+    using event_type = int;
+    void on_data(std::function<void(int)>);
+  };
+  struct expect_true {
+    using event_type = int;
+    void on_data(std::function<void(int)>);
+    optional<int> pull();
+  };
+  EXPECT_FALSE((concepts::is_source<expect_false_0>::value));
+  EXPECT_FALSE((concepts::is_source<expect_false_1>::value));
+  EXPECT_FALSE((concepts::is_source<expect_false_2>::value));
+  EXPECT_FALSE((concepts::is_source<expect_false_3>::value));
+  EXPECT_TRUE((concepts::is_source<expect_true>::value));
+}
+
 TEST(ChannelTest, MakeSimpleChannel) {
   auto endpoints = make_simple_channel_impl<std::string>();
   auto tx = std::move(endpoints.tx);
