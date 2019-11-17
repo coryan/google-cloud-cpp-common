@@ -187,7 +187,6 @@ TEST(ChannelTest, Transform) {
                 "requirements");
 }
 
-#if 0
 TEST(ChannelTest, Goal) {
   ASSERT_TRUE(false) << "Code not ready yet";
   // Create a channel that can hold up to 10 elements, and does not restart
@@ -237,7 +236,6 @@ TEST(ChannelTest, Goal) {
                   [&count] { return std::to_string(2 * count++); });
   EXPECT_THAT(actual, ElementsAre("2", "4", "6"));
 }
-#endif
 
 }  // namespace
 }  // namespace internal
