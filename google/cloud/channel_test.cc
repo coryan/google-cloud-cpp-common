@@ -24,6 +24,38 @@ namespace {
 
 using ::testing::ElementsAre;
 
+TEST(ChannelTest, ConceptsHasPush) {
+  struct expect_false {};
+  struct expect_true {
+    void push(int);
+  };
+  EXPECT_FALSE((concepts::has_push<expect_false, int>::value));
+  EXPECT_FALSE((concepts::has_push<expect_false, std::string>::value));
+  EXPECT_TRUE((concepts::has_push<expect_true, int>::value));
+}
+
+TEST(ChannelTest, ConceptsHasShutdown) {
+  struct missing_shutdown {};
+  struct mismatch_shutdown_type {};
+  struct expect_true {
+    void shutdown();
+  };
+  EXPECT_FALSE((concepts::has_shutdown<missing_shutdown>::value));
+  EXPECT_FALSE((concepts::has_shutdown<mismatch_shutdown_type>::value));
+  EXPECT_TRUE((concepts::has_shutdown<expect_true>::value));
+}
+
+TEST(ChannelTest, ConceptsIsSink) {
+  struct expect_false {};
+  struct expect_true {
+    void push(int);
+    void shutdown();
+  };
+  EXPECT_FALSE((concepts::is_sink<expect_false, int>::value));
+  EXPECT_FALSE((concepts::is_sink<expect_true, std::string>::value));
+  EXPECT_TRUE((concepts::is_sink<expect_true, int>::value));
+}
+
 TEST(ChannelTest, MakeSimpleChannel) {
   auto endpoints = make_simple_channel_impl<std::string>();
   auto tx = std::move(endpoints.tx);

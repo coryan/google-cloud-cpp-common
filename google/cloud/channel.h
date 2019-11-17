@@ -42,28 +42,36 @@ namespace concepts {
 template <typename>
 struct sfinae_true : public std::true_type {};
 
-template <typename Sink, typename T>
+template <typename Sink, typename T, typename AlwaysVoid = void>
 struct has_push_impl {
-  static auto test(int)
-      -> sfinae_true<decltype(std::declval<Sink>().push(std::declval<T>()))>;
-  static auto test(...) -> std::false_type { return {}; }
+  using type = std::false_type;
 };
 
 template <typename Sink, typename T>
+struct has_push_impl<
+    Sink, T, void_t<decltype(std::declval<Sink>().push(std::declval<T>()))>> {
+  using type = std::true_type;
+};
+
+template <typename Sink, typename T>
+struct has_push : has_push_impl<Sink, T>::type {};
+
+template <typename Sink, typename AlwaysVoid = void>
 struct has_shutdown_impl {
-  static auto test(int)
-      -> sfinae_true<decltype(std::declval<Sink>().shutdown())>;
-  static auto test(...) -> std::false_type { return {}; }
+  using type = std::false_type;
 };
 
-template <typename Sink, typename T>
-struct has_push : decltype(has_push_impl<Sink, T>::test(0)) {};
+template <typename Sink>
+struct has_shutdown_impl<Sink,
+                         void_t<decltype(std::declval<Sink>().shutdown())>> {
+  using type = std::true_type;
+};
+
+template <typename Sink>
+struct has_shutdown : has_shutdown_impl<Sink>::type {};
 
 template <typename Sink, typename T>
-struct has_shutdown : decltype(has_push_impl<Sink, T>::test(0)) {};
-
-template <typename Sink, typename T>
-struct is_sink : absl::conjunction<has_push<Sink, T>, has_shutdown<Sink, T>> {};
+struct is_sink : absl::conjunction<has_push<Sink, T>, has_shutdown<Sink>> {};
 
 template <typename Source, typename T>
 struct has_pull_impl {
@@ -414,31 +422,27 @@ transformed_source<decay_t<Source>, decay_t<Transform>> operator>>(
 }
 
 template <typename Source, typename Sink,
-    typename std::enable_if<concepts::is_source<decay_t<Source>>::value,
-                            int>::type = 0,
-    typename T = concepts::source_event_t<decay_t<Source>>,
-    typename std::enable_if<concepts::is_sink<decay_t<Sink>, T>::value,
-                            int>::type = 0>
+          typename std::enable_if<concepts::is_source<decay_t<Source>>::value,
+                                  int>::type = 0,
+          typename T = concepts::source_event_t<decay_t<Source>>,
+          typename std::enable_if<concepts::is_sink<decay_t<Sink>, T>::value,
+                                  int>::type = 0>
 // TODO() - return the error stream
-void operator>>(
-    Source&& source, Sink&& sink) {
+void operator>>(Source&& source, Sink&& sink) {
   struct Handler : public std::enable_shared_from_this<Handler> {
     decay_t<Source> source;
     decay_t<Sink> sink;
 
     Handler(Source&& so, Sink&& si)
-    : source(std::move(so)), sink(std::move(si)) {}
+        : source(std::move(so)), sink(std::move(si)) {}
 
     void start() {
       auto self = this->shared_from_this();
-      source.on_data([self](T value) {
-        self->sink.push(std::move(value));
-      });
+      source.on_data([self](T value) { self->sink.push(std::move(value)); });
     }
   };
-  auto handler = std::make_shared<Handler>(
-      std::forward<Source>(source),
-      std::forward<Sink>(sink));
+  auto handler = std::make_shared<Handler>(std::forward<Source>(source),
+                                           std::forward<Sink>(sink));
   handler->start();
 }
 
