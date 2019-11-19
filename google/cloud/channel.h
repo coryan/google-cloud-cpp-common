@@ -85,24 +85,28 @@ struct has_pull_impl<Source, T,
 template <typename Source, typename T>
 struct has_pull : has_pull_impl<Source, T>::type {};
 
+/**
+ * A helper class to implement has_connect<>
+ */
+template <typename T>
+struct has_connect_impl_handler {
+  void push(T) {}
+  void shutdown() {}
+};
+
 template <typename Source, typename T, typename AlwaysVoid = void>
-struct has_on_data_impl {
+struct has_connect_impl {
   using type = std::false_type;
 };
 
-template <typename T>
-struct has_on_data_impl_handler {
-  on_data_resolution operator()(T) { return on_data_resolution::kDone; }
-};
-
 template <typename Source, typename T>
-struct has_on_data_impl<Source, T, void_t<decltype(
-    std::declval<Source>().on_data(has_on_data_impl_handler<T>{})
-    )>>  {
+struct has_connect_impl<Source, T,
+                        void_t<decltype(std::declval<Source>().connect(
+                            has_connect_impl_handler<T>{}))>> {
   using type = std::true_type;
 };
 template <typename Source, typename T>
-struct has_on_data : has_on_data_impl<Source, T>::type {};
+struct has_connect : has_connect_impl<Source, T>::type {};
 
 template <typename Source, class AlwaysVoid = void>
 struct has_event_type : public std::false_type {};
@@ -144,9 +148,19 @@ struct is_source
                         has_pull<Source, source_event_t<Source>>,
                         std::is_same<optional<source_event_t<Source>>,
                                      source_pull_result_t<Source>>,
-                        has_on_data<Source, source_event_t<Source>>> {};
+                        has_connect<Source, source_event_t<Source>>> {};
 
 }  // namespace concepts
+
+template <typename T /*, typename E = std::exception_ptr */>
+class sink_interface {
+ public:
+  virtual ~sink_interface() = default;
+
+  virtual void shutdown() = 0;
+  virtual void push(T value) = 0;
+  /* virtual void push_error(E value) = 0; */
+};
 
 /**
  * A thread-safe queue with high and low watermarks to control flow.
@@ -154,8 +168,6 @@ struct is_source
 template <typename T>
 class simple_channel {
  public:
-  using on_data_handler = std::function<on_data_resolution(T)>;
-
   simple_channel() = default;
   simple_channel(std::size_t lwm, std::size_t hwm) : lwm_(lwm), hwm_(hwm) {}
 
@@ -167,14 +179,11 @@ class simple_channel {
     }
     state_ =
         buffer_.empty() ? channel_state::kShutdown : channel_state::kDraining;
-    // Invoke any pending callbacks.
-    while (!on_has_data_.empty()) {
-      auto action = std::move(on_has_data_.front());
-      on_has_data_.pop_front();
-      lk.unlock();
-      action(T{});
-      lk.lock();
+    if (!sink_) {
+      return;
     }
+    lk.unlock();
+    sink_->shutdown();
   }
 
   optional<T> pull() {
@@ -192,28 +201,36 @@ class simple_channel {
     if (state_ != channel_state::kAccepting) {
       return;
     }
-    if (on_has_data_.empty()) {
-      push_wait_.wait(lk, [this] { return buffer_.size() < hwm_; });
+    if (!sink_) {
+      push_wait_.wait(lk, [this] { return buffer_.size() < lwm_; });
       buffer_.push_back(std::move(value));
       pull_wait_.notify_all();
       return;
     }
-    auto action = std::move(on_has_data_.front());
-    on_has_data_.pop_front();
     lk.unlock();
-    invoke_has_data_handler(std::move(action), std::move(value));
+    sink_->push(std::move(value));
   }
 
-  void on_has_data(on_data_handler h) {
+  template <typename Sink>
+  void connect(Sink&& sink) {
+    struct type_erased : public sink_interface<T> {
+      explicit type_erased(Sink&& sink) : sink_(std::move(sink)) {}
+
+      void shutdown() override { sink_.shutdown(); }
+      void push(T value) override { sink_.push(std::move(value)); }
+      /* virtual void push_error(E value) = 0; */
+
+      absl::decay_t<Sink> sink_;
+    };
     std::unique_lock<std::mutex> lk(mu_);
-    if (!buffer_.empty()) {
-      auto value = pop(lk);
+    sink_ = make_unique<type_erased>(std::forward<Sink>(sink));
+    while (!buffer_.empty()) {
+      T value = std::move(buffer_.front());
+      buffer_.pop_front();
       lk.unlock();
-      if (value.has_value()) return;
-      invoke_has_data_handler(std::move(h), *std::move(value));
-      return;
+      sink_->push(std::move(value));
+      lk.lock();
     }
-    on_has_data_.push_back(std::move(h));
   }
 
   class source {
@@ -224,8 +241,9 @@ class simple_channel {
 
     optional<T> pull() { return channel_->pull(); }
 
-    void on_data(on_data_handler handler) {
-      channel_->on_has_data(std::move(handler));
+    template <typename Sink>
+    void connect(Sink&& sink) && {
+      return channel_->connect(std::forward<Sink>(sink));
     }
 
    private:
@@ -263,20 +281,11 @@ class simple_channel {
     return value;
   }
 
-  void invoke_has_data_handler(on_data_handler handler, T value) {
-    auto resolution = handler(std::move(value));
-    if (resolution == kDone) {
-      return;
-    }
-    on_has_data(std::move(handler));
-  }
-
-  // TODO(...) - this might benefit from using a lock-free queue in some cases.
   std::mutex mu_;
   std::condition_variable push_wait_;
   std::condition_variable pull_wait_;
   std::deque<T> buffer_;
-  std::deque<on_data_handler> on_has_data_;
+  std::unique_ptr<sink_interface<T>> sink_;
   std::size_t lwm_ = std::numeric_limits<std::size_t>::max() - 1;
   std::size_t hwm_ = std::numeric_limits<std::size_t>::max();
   channel_state state_ = channel_state::kAccepting;
@@ -296,6 +305,41 @@ typename simple_channel<T>::endpoints make_simple_channel_impl(
   return {typename simple_channel<T>::sink(channel),
           typename simple_channel<T>::source(channel)};
 }
+
+class callback_semaphore {
+ public:
+  explicit callback_semaphore(
+      std::uint64_t capacity = (std::numeric_limits<std::uint64_t>::max)())
+      : capacity_(capacity), used_(0) {}
+
+  void release(std::unique_lock<std::mutex>& lk) {
+    used_--;
+    if (used_ < capacity_ && waiter_) {
+      std::function<void()> callable;
+      callable.swap(waiter_);
+      used_++;
+      lk.unlock();
+      callable();
+      return;
+    }
+  }
+
+  template <typename Callable>
+  void test(std::unique_lock<std::mutex>& lk, Callable&& callable) {
+    if (used_ < capacity_) {
+      used_++;
+      lk.unlock();
+      callable();
+      return;
+    }
+    waiter_ = std::forward<Callable>(callable);
+  }
+
+ private:
+  std::uint64_t capacity_;
+  std::uint64_t used_;
+  std::function<void()> waiter_;
+};
 
 template <typename T, typename Source>
 class flow_control_junction {
@@ -369,7 +413,7 @@ class generator_source {
   optional<T> pull() { return callable_(); }
 
   template <typename Handler>
-  void on_data(Handler handler) {
+  void connect(Handler handler) {
     for (auto r = handler(callable_()); r == on_data_resolution::kReschedule;
          r = handler(callable_())) {
     }
@@ -379,15 +423,13 @@ class generator_source {
   Callable callable_;
 };
 
-template <typename T>
-using decay_t = typename std::decay<T>::type;
-
 template <typename Callable>
-generator_source<decay_t<Callable>> generator(Callable&& callable) {
+generator_source<absl::decay_t<Callable>> generator(Callable&& callable) {
   static_assert(
-      concepts::is_source<generator_source<decay_t<Callable>>>::value,
+      concepts::is_source<generator_source<absl::decay_t<Callable>>>::value,
       "generator_source<> should meet concepts::is_source<> requirements");
-  return generator_source<decay_t<Callable>>(std::forward<Callable>(callable));
+  return generator_source<absl::decay_t<Callable>>(
+      std::forward<Callable>(callable));
 }
 
 template <typename Source, typename Pipeline>
@@ -407,7 +449,7 @@ class transformed_source {
   void on_data(Handler&& handler) {
     struct Wrapper {
       transformed_source* self;
-      decay_t<Handler> handler;
+      absl::decay_t<Handler> handler;
 
       on_data_resolution operator()(typename Source::event_type x) {
         return handler(self->pipeline_(std::move(x)));
@@ -422,27 +464,27 @@ class transformed_source {
 };
 
 template <typename Source, typename Transform,
-          typename std::enable_if<concepts::is_source<decay_t<Source>>::value,
-                                  int>::type = 0,
-          typename T = concepts::source_event_t<decay_t<Source>>,
-          typename U = invoke_result_t<decay_t<Transform>, T>>
-transformed_source<decay_t<Source>, decay_t<Transform>> operator>>(
+          typename std::enable_if<
+              concepts::is_source<absl::decay_t<Source>>::value, int>::type = 0,
+          typename T = concepts::source_event_t<absl::decay_t<Source>>,
+          typename U = invoke_result_t<absl::decay_t<Transform>, T>>
+transformed_source<absl::decay_t<Source>, absl::decay_t<Transform>> operator>>(
     Source&& source, Transform&& transform) {
-  return transformed_source<decay_t<Source>, decay_t<Transform>>(
+  return transformed_source<absl::decay_t<Source>, absl::decay_t<Transform>>(
       std::forward<Source>(source), std::forward<Transform>(transform));
 }
 
 template <typename Source, typename Sink,
-          typename std::enable_if<concepts::is_source<decay_t<Source>>::value,
-                                  int>::type = 0,
-          typename T = concepts::source_event_t<decay_t<Source>>,
-          typename std::enable_if<concepts::is_sink<decay_t<Sink>, T>::value,
-                                  int>::type = 0>
+          typename std::enable_if<
+              concepts::is_source<absl::decay_t<Source>>::value, int>::type = 0,
+          typename T = concepts::source_event_t<absl::decay_t<Source>>,
+          typename std::enable_if<
+              concepts::is_sink<absl::decay_t<Sink>, T>::value, int>::type = 0>
 // TODO() - return the error stream
 void operator>>(Source&& source, Sink&& sink) {
   struct Handler : public std::enable_shared_from_this<Handler> {
-    decay_t<Source> source;
-    decay_t<Sink> sink;
+    absl::decay_t<Source> source;
+    absl::decay_t<Sink> sink;
 
     Handler(Source&& so, Sink&& si)
         : source(std::move(so)), sink(std::move(si)) {}

@@ -70,18 +70,18 @@ struct has_on_data_generic {
   void on_data(Functor&&) {}
 };
 
-TEST(ChannelTest, ConceptsOnData) {
+TEST(ChannelTest, ConceptsConnect) {
   struct expect_false {};
   struct mismatched_type {
-    void on_data(int);
+    void connect(int);
   };
   struct expect_true {
-    void on_data(std::function<void(int)>);
+    void connect(std::function<void(int)>);
   };
-  EXPECT_FALSE((concepts::has_on_data<expect_false, int>::value));
-  EXPECT_FALSE((concepts::has_on_data<mismatched_type, int>::value));
-  EXPECT_TRUE((concepts::has_on_data<expect_true, int>::value));
-  EXPECT_TRUE((concepts::has_on_data<has_on_data_generic, int>::value));
+  EXPECT_FALSE((concepts::has_connect<expect_false, int>::value));
+  EXPECT_FALSE((concepts::has_connect<mismatched_type, int>::value));
+  EXPECT_TRUE((concepts::has_connect<expect_true, int>::value));
+  EXPECT_TRUE((concepts::has_connect<has_on_data_generic, int>::value));
 }
 
 TEST(ChannelTest, ConceptsEventType) {
@@ -157,7 +157,7 @@ TEST(ChannelTest, GeneratorBasic) {
   EXPECT_EQ(42, *tested.pull());
 
   std::vector<int> actual;
-  tested.on_data([&actual](int v) {
+  tested.connect([&actual](int v) {
     actual.push_back(v);
     return actual.size() < 3 ? internal::on_data_resolution::kReschedule
                              : internal::on_data_resolution::kDone;
