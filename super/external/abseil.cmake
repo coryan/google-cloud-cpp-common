@@ -20,7 +20,8 @@ if (NOT TARGET abseil-cpp-project)
     # Give application developers a hook to configure the version and hash
     # downloaded from GitHub.
     set(GOOGLE_CLOUD_CPP_ABSEIL_CPP_URL
-        "https://github.com/abseil/abseil-cpp/archive/85092b4b648ca729c6263c4a302a41dfff28705e.tar.gz")
+        "https://github.com/abseil/abseil-cpp/archive/85092b4b648ca729c6263c4a302a41dfff28705e.tar.gz"
+    )
     set(GOOGLE_CLOUD_CPP_ABSEIL_CPP_SHA256
         "0db540c67e9da547c48b18087c28d95ae4798721a67e0a001f9ce905be3df918")
 
