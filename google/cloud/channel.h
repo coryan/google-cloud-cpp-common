@@ -501,6 +501,39 @@ void operator>>(Source&& source, Sink&& sink) {
 
 }  // namespace internal
 
+/**
+ * A type erased sink.
+ */
+template <typename T>
+class sink {
+ public:
+  sink() = default;
+
+  template <typename Sink,
+            typename std::enable_if<
+                internal::concepts::is_sink<absl::decay_t<Sink>, T>::value,
+                int>::type = 0>
+  sink(Sink&& sink) {
+    class wrap : public internal::sink_interface<T> {
+     public:
+      wrap(Sink&& s) : impl_(std::move(s)) {}
+
+      void shutdown() override { impl_.shutdown(); }
+      void push(T value) override { impl_.push(std::move(value)); }
+
+     private:
+      absl::decay_t<Sink> impl_;
+    };
+    impl_.reset(new wrap(std::forward<Sink>(sink)));
+  }
+
+  void shutdown() { impl_->shutdown(); }
+  void push(T value) { impl_->push(std::move(value)); }
+
+ private:
+  std::shared_ptr<internal::sink_interface<T>> impl_;
+};
+
 }  // namespace GOOGLE_CLOUD_CPP_NS
 }  // namespace cloud
 }  // namespace google
