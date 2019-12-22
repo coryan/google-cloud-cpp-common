@@ -402,35 +402,23 @@ flow_control_endpoints<T, Source, Sink> flow_control_impl(
   return {std::move(sink), std::move(junction), std::move(cap_endpoints.rx)};
 }
 
-template <typename Callable, typename T = invoke_result_t<Callable>>
-class generator_source {
+template <typename Source, typename Sink>
+class connected_pipeline_synchronous {
  public:
-  using event_type = T;
+  connected_pipeline_synchronous(Source source, Sink sink)
+      : source_(std::move(source)), sink_(std::move(sink)) {}
 
-  explicit generator_source(Callable&& callable)
-      : callable_(std::move(callable)) {}
-
-  optional<T> pull() { return callable_(); }
-
-  template <typename Handler>
-  void connect(Handler handler) {
-    for (auto r = handler(callable_()); r == on_data_resolution::kReschedule;
-         r = handler(callable_())) {
+  void start() {
+    while (auto tmp = source_.pull()) {
+      sink_.push(*std::move(tmp));
     }
+    sink_.shutdown();
   }
 
  private:
-  Callable callable_;
+  Source source_;
+  Sink sink_;
 };
-
-template <typename Callable>
-generator_source<absl::decay_t<Callable>> generator(Callable&& callable) {
-  static_assert(
-      concepts::is_source<generator_source<absl::decay_t<Callable>>>::value,
-      "generator_source<> should meet concepts::is_source<> requirements");
-  return generator_source<absl::decay_t<Callable>>(
-      std::forward<Callable>(callable));
-}
 
 template <typename Source, typename Pipeline>
 class transformed_source {
@@ -445,23 +433,66 @@ class transformed_source {
     return pipeline_(*std::move(tmp));
   }
 
-  template <typename Handler>
-  void on_data(Handler&& handler) {
-    struct Wrapper {
-      transformed_source* self;
-      absl::decay_t<Handler> handler;
-
-      on_data_resolution operator()(typename Source::event_type x) {
-        return handler(self->pipeline_(std::move(x)));
-      }
-    };
-    source_.on_data(Wrapper{this, std::forward<Handler>(handler)});
+  template <typename Sink>
+  auto connect(Sink&& sink) && -> connected_pipeline_synchronous<
+      transformed_source, absl::decay_t<Sink>> {
+    return connected_pipeline_synchronous<transformed_source,
+                                          absl::decay_t<Sink>>(
+        std::move(*this), std::forward<Sink>(sink));
   }
 
  private:
   Source source_;
   Pipeline pipeline_;
 };
+
+template <typename T>
+struct trivial_sink {
+  void push(T) {}
+  void shutdown(){};
+};
+
+template <typename Callable, typename T = invoke_result_t<Callable>>
+class generator_source;
+template <typename Callable>
+generator_source<absl::decay_t<Callable>> generator(std::size_t count,
+                                                    Callable&& callable);
+
+template <typename Callable, typename T>
+class generator_source {
+ public:
+  using event_type = T;
+
+  explicit generator_source(std::size_t count, Callable callable)
+      : count_(count), callable_(std::move(callable)) {}
+
+  optional<T> pull() {
+    if (count_ == 0) return {};
+    --count_;
+    return callable_();
+  }
+
+  template <typename Sink>
+  auto connect(
+      Sink sink) && -> connected_pipeline_synchronous<generator_source, Sink> {
+    return connected_pipeline_synchronous<generator_source, Sink>{
+        *this, std::move(sink)};
+  }
+
+ private:
+  std::size_t count_;
+  Callable callable_;
+};
+
+template <typename Callable>
+generator_source<absl::decay_t<Callable>> generator(std::size_t count,
+                                                    Callable&& callable) {
+  static_assert(
+      concepts::is_source<generator_source<absl::decay_t<Callable>>>::value,
+      "generator_source<> should meet concepts::is_source<> requirements");
+  return generator_source<absl::decay_t<Callable>>(
+      count, std::forward<Callable>(callable));
+}
 
 template <typename Source, typename Transform,
           typename std::enable_if<

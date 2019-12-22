@@ -65,9 +65,9 @@ TEST(ChannelTest, ConceptsHasPull) {
   EXPECT_TRUE((concepts::has_pull<expect_true, int>::value));
 }
 
-struct has_on_data_generic {
+struct has_connect_generic {
   template <typename Functor>
-  void on_data(Functor&&) {}
+  void connect(Functor&&) {}
 };
 
 TEST(ChannelTest, ConceptsConnect) {
@@ -81,7 +81,7 @@ TEST(ChannelTest, ConceptsConnect) {
   EXPECT_FALSE((concepts::has_connect<expect_false, int>::value));
   EXPECT_FALSE((concepts::has_connect<mismatched_type, int>::value));
   EXPECT_TRUE((concepts::has_connect<expect_true, int>::value));
-  EXPECT_TRUE((concepts::has_connect<has_on_data_generic, int>::value));
+  EXPECT_TRUE((concepts::has_connect<has_connect_generic, int>::value));
 }
 
 TEST(ChannelTest, ConceptsEventType) {
@@ -99,16 +99,16 @@ TEST(ChannelTest, ConceptsIsSource) {
     optional<int> pull();
   };
   struct expect_false_2 {
-    void on_data(std::function<void(int)>);
+    void connect(std::function<void(int)>);
     optional<int> pull();
   };
   struct expect_false_3 {
     using event_type = int;
-    void on_data(std::function<void(int)>);
+    void connect(std::function<void(int)>);
   };
   struct expect_true {
     using event_type = int;
-    void on_data(std::function<void(int)>);
+    void connect(std::function<void(int)>);
     optional<int> pull();
   };
   EXPECT_FALSE((concepts::is_source<expect_false_0>::value));
@@ -153,16 +153,12 @@ TEST(ChannelTest, SimpleChannelTraits) {
 }
 
 TEST(ChannelTest, GeneratorBasic) {
-  auto tested = internal::generator([]() -> int { return 42; });
-  EXPECT_EQ(42, *tested.pull());
-
-  std::vector<int> actual;
-  tested.connect([&actual](int v) {
-    actual.push_back(v);
-    return actual.size() < 3 ? internal::on_data_resolution::kReschedule
-                             : internal::on_data_resolution::kDone;
-  });
-  EXPECT_THAT(actual, ElementsAre(42, 42, 42));
+  int count = 0;
+  auto tested = internal::generator(3, [&count]() -> int { return ++count; });
+  EXPECT_EQ(1, *tested.pull());
+  EXPECT_EQ(2, *tested.pull());
+  EXPECT_EQ(3, *tested.pull());
+  EXPECT_FALSE(tested.pull().has_value());
 
   static_assert(internal::concepts::is_source<decltype(tested)>::value,
                 "The result of generator() should meet the is_source<S> "
@@ -171,15 +167,16 @@ TEST(ChannelTest, GeneratorBasic) {
 
 TEST(ChannelTest, Transform) {
   int count = 0;
-  auto gen = internal::generator([&count]() { return ++count; });
-  auto tested = gen >> [](int x) { return 2 * x; } >>
-                [](int x) { return std::to_string(x); };
+  auto gen = internal::generator(3, [&count]() { return ++count; });
   std::vector<std::string> actual;
-  tested.on_data([&actual](std::string v) {
+  auto tested = gen >> [](int x) { return 2 * x; } >> [](int x) {
+    return std::to_string(x);
+  } >> [&actual](std::string v) -> int {
     actual.push_back(std::move(v));
-    return actual.size() < 3 ? internal::on_data_resolution::kReschedule
-                             : internal::on_data_resolution::kDone;
-  });
+    return 0;
+  };
+  auto pipeline = std::move(tested).connect(internal::trivial_sink<int>{});
+  pipeline.start();
   EXPECT_THAT(actual, ElementsAre("2", "4", "6"));
 
   static_assert(internal::concepts::is_source<decltype(gen)>::value,
