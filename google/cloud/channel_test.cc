@@ -22,6 +22,10 @@ inline namespace GOOGLE_CLOUD_CPP_NS {
 namespace internal {
 namespace {
 
+TEST(ChannelTest, Basic) {
+
+}
+
 }  // namespace
 }  // namespace internal
 }  // namespace GOOGLE_CLOUD_CPP_NS
