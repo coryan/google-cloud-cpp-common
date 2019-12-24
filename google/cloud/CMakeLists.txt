@@ -209,6 +209,7 @@ add_subdirectory(testing_util)
 if (BUILD_TESTING)
     set(google_cloud_cpp_common_unit_tests
         # cmake-format: sort
+        channel_test.cc
         future_generic_test.cc
         future_generic_then_test.cc
         future_void_test.cc
