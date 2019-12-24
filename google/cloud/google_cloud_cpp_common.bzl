@@ -55,6 +55,7 @@ google_cloud_cpp_common_hdrs = [
     "status_or.h",
     "terminate_handler.h",
     "version.h",
+    "channel.h",
 ]
 
 google_cloud_cpp_common_srcs = [
