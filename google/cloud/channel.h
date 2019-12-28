@@ -15,9 +15,11 @@
 #ifndef GOOGLE_CLOUD_CPP_GOOGLE_CLOUD_CHANNEL_H_
 #define GOOGLE_CLOUD_CPP_GOOGLE_CLOUD_CHANNEL_H_
 
+#include "google/cloud/future.h"
 #include "google/cloud/internal/invoke_result.h"
 #include "google/cloud/optional.h"
 #include "google/cloud/version.h"
+#include <deque>
 #include <memory>
 
 namespace google {
@@ -101,6 +103,160 @@ class generate_n_source {
  private:
   std::size_t count_;
   Generator generator_;
+};
+
+enum class channel_state {
+  kAccepting,
+  kDraining,
+  kShutdown,
+};
+
+/**
+ * A thread-safe queue with high and low watermarks to control flow.
+ */
+template <typename T>
+class simple_channel : public std::enable_shared_from_this<simple_channel<T>> {
+ public:
+  simple_channel() = default;
+  simple_channel(std::size_t lwm, std::size_t hwm) : lwm_(lwm), hwm_(hwm) {}
+
+  void shutdown() {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (state_ != channel_state::kAccepting) {
+      // Already draining or shutdown.
+      return;
+    }
+    state_ =
+        buffer_.empty() ? channel_state::kShutdown : channel_state::kDraining;
+    if (!sink_) {
+      return;
+    }
+    lk.unlock();
+    sink_->shutdown();
+  }
+
+  optional<T> pull() {
+    std::unique_lock<std::mutex> lk(mu_);
+    pull_wait_.wait(lk, [this] {
+      return !buffer_.empty() || state_ == channel_state::kShutdown;
+    });
+    auto value = pop(lk);
+    lk.unlock();
+    return value;
+  }
+
+  void push(T value) {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (state_ != channel_state::kAccepting) {
+      return;
+    }
+    if (!sink_) {
+      push_wait_.wait(lk, [this] { return buffer_.size() < lwm_; });
+      buffer_.push_back(std::move(value));
+      pull_wait_.notify_all();
+      return;
+    }
+    lk.unlock();
+    sink_->push(std::move(value));
+  }
+
+  void drain(std::unique_ptr<sink_impl<T>> sink) {
+    // Drain any queued messages, afterwards all messages will be pushed
+    // automatically.
+    std::unique_lock<std::mutex> lk(mu_);
+    while (!buffer_.empty()) {
+      T value = std::move(buffer_.front());
+      buffer_.pop_front();
+      lk.unlock();
+      sink_->push(std::move(value));
+      lk.lock();
+    }
+    sink_ = std::move(sink);
+  }
+
+  struct pipeline {
+   public:
+    explicit pipeline(std::shared_ptr<simple_channel> channel,
+                      std::unique_ptr<sink_impl<T>> sink)
+        : channel_(std::move(channel)), sink_(std::move(sink)) {}
+
+    void start() { channel_->drain(std::move(sink_)); }
+
+   private:
+    std::shared_ptr<simple_channel> channel_;
+    std::unique_ptr<sink_impl<T>> sink_;
+  };
+
+  template <typename Sink>
+  void connect(Sink&& sink) && {
+    struct type_erased : public sink_impl<T> {
+      explicit type_erased(Sink&& sink) : sink_(std::move(sink)) {}
+
+      void shutdown() override { sink_.shutdown(); }
+      void push(T value) override { sink_.push(std::move(value)); }
+
+      typename std::decay<Sink>::type sink_;
+    };
+    return pipeline(this->shared_from_this(),
+                    make_unique<type_erased>(std::forward<Sink>(sink)));
+  }
+
+  class source {
+   public:
+    using event_type = T;
+    explicit source(std::shared_ptr<simple_channel> channel)
+        : channel_(std::move(channel)) {}
+
+    optional<T> pull() { return channel_->pull(); }
+
+    template <typename Sink>
+    void connect(Sink&& sink) && {
+      return channel_->connect(std::forward<Sink>(sink));
+    }
+
+   private:
+    std::shared_ptr<simple_channel> channel_;
+  };
+
+  class sink {
+   public:
+    explicit sink(std::shared_ptr<simple_channel> channel)
+        : channel_(std::move(channel)) {}
+
+    void push(T value) { channel_->push(std::move(value)); }
+    void shutdown() { channel_->shutdown(); }
+
+   private:
+    std::shared_ptr<simple_channel> channel_;
+  };
+
+  struct endpoints {
+    sink tx;
+    source rx;
+  };
+
+ private:
+  optional<T> pop(std::unique_lock<std::mutex>&) {
+    if (state_ == channel_state::kShutdown) {
+      return {};
+    }
+    auto value = std::move(buffer_.front());
+    buffer_.pop_front();
+    if (state_ == channel_state::kDraining && buffer_.size() < lwm_) {
+      state_ = channel_state::kAccepting;
+      push_wait_.notify_all();
+    }
+    return value;
+  }
+
+  std::mutex mu_;
+  std::condition_variable push_wait_;
+  std::condition_variable pull_wait_;
+  std::deque<T> buffer_;
+  std::unique_ptr<sink_impl<T>> sink_;
+  std::size_t lwm_ = std::numeric_limits<std::size_t>::max() - 1;
+  std::size_t hwm_ = std::numeric_limits<std::size_t>::max();
+  channel_state state_ = channel_state::kAccepting;
 };
 
 }  // namespace internal
