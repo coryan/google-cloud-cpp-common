@@ -27,21 +27,20 @@ template <typename T>
 class simple_source {
  public:
   virtual void start() {}
-  future<optional<T>> async_pull_one() { return {}; }
-  optional<T> pull_one() { return async_pull_one().get(); }
+  virtual future<optional<T>> async_pull_one() { return {}; }
 };
 
 template <typename T>
 class simple_sink {
  public:
-  void shutdown() {}
-  future<void> async_push_one(T) { return {}; }
+  virtual void shutdown() {}
+  virtual future<void> async_push_one(T) { return {}; }
 };
 
-template <typename T>
+template <typename I, typename O>
 struct channel {
-  simple_sink<T> tx;
-  simple_source<T> rx;
+  simple_sink<I> tx;
+  simple_source<O> rx;
 };
 
 struct pipeline {
@@ -49,7 +48,7 @@ struct pipeline {
 };
 
 template <typename T>
-channel<T> keep_in_flight(int) {
+channel<T, T> keep_in_flight(int) {
   return {};
 }
 
@@ -78,13 +77,113 @@ class bound_source : public simple_source<T> {
 };
 
 template <typename T>
-simple_source<T> operator|(simple_source<T> s, channel<T> c) {
+simple_source<T> operator|(simple_source<T> s, channel<T, T> c) {
   auto p = s | std::move(c.tx);
   return bound_source<T>(std::move(p), std::move(c.rx));
 }
 
+template <typename I, typename O>
+class transform_channel_state {
+ public:
+  using Generator = std::function<void(I, simple_sink<O>&)>;
+  explicit transform_channel_state(Generator gen) {
+    auto in = channel<I, I>{};
+    channel_input_ = std::move(in.tx);
+    generator_input_ = std::move(in.rx);
+
+    generator_ = std::move(gen);
+
+    auto out = channel<O, O>{};
+    generator_output_ = std::move(out.tx);
+    channel_output_ = std::move(out.rx);
+  }
+
+  //@{
+  void start() {
+    schedule();
+    generator_input_.start();
+  }
+  future<optional<O>> async_pull_one() {
+    return channel_output_.async_pull_one();
+  }
+  //@}
+
+  //@{
+  void shutdown() { channel_input_.shutdown(); }
+  future<void> async_push_one(I value) {
+    return channel_input_.async_push_one(std::move(value));
+  }
+  //@}
+
+ private:
+  void schedule() {
+    generator_input_.async_pull_one().then([this](future<optional<I>> f) {
+      auto o = f.get();
+      if (!o.has_value()) {
+        generator_output_.shutdown();
+        return;
+      }
+      generator_(*std::move(o), generator_output_);
+      schedule();
+    });
+  }
+
+  simple_sink<I> channel_input_;
+  simple_source<I> generator_input_;
+  Generator generator_;
+  simple_sink<I> generator_output_;
+  simple_source<O> channel_output_;
+};
+
+template <typename T, typename Channel>
+class channel_source : simple_source<T> {
+ public:
+  explicit channel_source(std::shared_ptr<Channel> c) : channel_(std::move(c)) {}
+
+  future<optional<T>> async_pull_one() override {
+    return channel_->async_pull_one();
+  }
+  void start() override { return channel_->start(); }
+
+ private:
+  std::shared_ptr<Channel> channel_;
+};
+
+template <typename T, typename Channel>
+class channel_sink : simple_sink<T> {
+ public:
+  explicit channel_sink(std::shared_ptr<Channel> c) : channel_(std::move(c)) {}
+
+  future<void> async_push_one(T value) override {
+    return channel_->async_push_one(std::move(value));
+  }
+  void shutdown() override { channel_->shutdown(); }
+
+ private:
+  std::shared_ptr<Channel> channel_;
+};
+
+template <typename I, typename O, typename Generator>
+channel<I, O> transform_channel(Generator gen) {
+  using Channel = transform_channel_state<I, O>;
+  auto c = std::make_shared<Channel>(std::move(gen));
+  channel_sink<I, Channel> sink(c);
+  channel_source<O, Channel> source(c);
+  // TODO(coryan) - fix the slicing.
+  return {};
+}
+
+void by_line(std::string const& input, simple_sink<std::string> output) {
+  std::istringstream is(input);
+  std::string line;
+  while (std::getline(is, line)) {
+    output.async_push_one(std::move(line)).get();
+  }
+}
+
 TEST(ChannelTest, Goal) {
   pipeline p = simple_source<int>{} | [](int x) { return std::to_string(x); } |
+               transform_channel<std::string, std::string>(by_line) |
                keep_in_flight<std::string>(8) | simple_sink<std::string>{};
   p.start();
 }
