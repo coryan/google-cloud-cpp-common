@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "google/cloud/future.h"
+#include "google/cloud/optional.h"
 #include "google/cloud/testing_util/chrono_literals.h"
 #include <gmock/gmock.h>
 
@@ -21,10 +23,80 @@ inline namespace GOOGLE_CLOUD_CPP_NS {
 namespace internal {
 namespace {
 
+template <typename T>
+class simple_source {
+ public:
+  virtual void start() {}
+  future<optional<T>> async_pull_one() { return {}; }
+  optional<T> pull_one() { return async_pull_one().get(); }
+};
+
+template <typename T>
+class simple_sink {
+ public:
+  void shutdown() {}
+  future<void> async_push_one(T) { return {}; }
+};
+
+template <typename T>
+struct channel {
+  simple_sink<T> tx;
+  simple_source<T> rx;
+};
+
+struct pipeline {
+  virtual void start() {}
+};
+
+template <typename T>
+channel<T> keep_in_flight(int) {
+  return {};
+}
+
+template <typename T, typename Functor>
+simple_source<internal::invoke_result_t<Functor, T>> operator|(simple_source<T>,
+                                                               Functor&&) {
+  return {};
+}
+
+template <typename T>
+pipeline operator|(simple_source<T>, simple_sink<T>) {
+  return {};
+}
+
+template <typename T>
+class bound_source : public simple_source<T> {
+ public:
+  bound_source(pipeline p, simple_source<T> s)
+      : pipeline_(std::move(p)), source_(std::move(s)) {}
+
+  void start() override { pipeline_.start(); }
+
+ private:
+  pipeline pipeline_;
+  simple_source<T> source_;
+};
+
+template <typename T>
+simple_source<T> operator|(simple_source<T> s, channel<T> c) {
+  auto p = s | std::move(c.tx);
+  return bound_source<T>(std::move(p), std::move(c.rx));
+}
+
+TEST(ChannelTest, Goal) {
+  pipeline p = simple_source<int>{} | [](int x) { return std::to_string(x); } |
+               keep_in_flight<std::string>(8) | simple_sink<std::string>{};
+  p.start();
+}
+
+#if 0
+template <typename T>
 class in_flight_connector {
  public:
-  void start(int n) {
-    for (int i = 0; i != n; ++i) done();
+  in_flight_connector(int n) : n_(n) {}
+
+  void start() {
+    for (int i = 0; i != n_; ++i) done();
   }
 
   void send_one(optional<std::string> v) {
@@ -34,41 +106,19 @@ class in_flight_connector {
     });
   }
 
-  void shutdown() {
-    output_.shutdown();
-  }
+  void shutdown() { output_.shutdown(); }
 
  private:
   void done() {
-    input_.async_pull_one().then([this](future<optional<std::string>> f) {
-      send_one(f.get());
-    });
+    input_.async_pull_one().then(
+        [this](future<optional<std::string>> f) { send_one(f.get()); });
   }
 
-  internal::simple_channel<std::string> input_;
-  internal::simple_channel<std::string> output_;
+  int n_;
+  simple_source<T> input_;
+  simple_sink<T> output_;
 };
-
-TEST(ChannelTest, Goal) {
-  using ms = std::chrono::milliseconds;
-
-  auto endpoints = internal::make_simple_channel<int>();
-  auto tx = std::move(endpoints.tx);
-  auto rx = std::move(endpoints.rx);
-
-  std::thread generator([&tx] {
-    for(int i = 0; i != 10; ++i) {
-      tx.push(i);
-      std::this_thread::sleep_for(ms(10));
-    }
-  });
-
-  rx | [](int x) { return std::to_string(x); } |
-
-
-
-  generator.join();
-}
+#endif  //
 
 }  // namespace
 }  // namespace internal
