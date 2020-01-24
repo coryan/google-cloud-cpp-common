@@ -61,7 +61,7 @@ class AsyncTimerFuture : public internal::AsyncGrpcOperation {
   }
 
  private:
-  bool Notify(CompletionQueue&, bool) override {
+  bool Notify(bool) override {
     promise_.set_value(deadline_);
     return true;
   }
@@ -76,7 +76,7 @@ class AsyncTimerFuture : public internal::AsyncGrpcOperation {
 
 CompletionQueue::CompletionQueue() : impl_(new internal::CompletionQueueImpl) {}
 
-void CompletionQueue::Run() { impl_->Run(*this); }
+void CompletionQueue::Run() { impl_->Run(); }
 
 void CompletionQueue::Shutdown() { impl_->Shutdown(); }
 
@@ -86,7 +86,7 @@ google::cloud::future<std::chrono::system_clock::time_point>
 CompletionQueue::MakeDeadlineTimer(
     std::chrono::system_clock::time_point deadline) {
   auto op = std::make_shared<AsyncTimerFuture>(impl_->CreateAlarm());
-  void* tag = impl_->RegisterOperation(*this, op);
+  void* tag = impl_->RegisterOperation(op);
   if (tag != nullptr) {
     op->Set(impl_->cq(), deadline, tag);
   }

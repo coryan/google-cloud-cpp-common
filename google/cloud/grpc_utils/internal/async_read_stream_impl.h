@@ -146,7 +146,7 @@ class AsyncReadStreamImpl
 
      private:
       void Cancel() override {}  // LCOV_EXCL_LINE
-      bool Notify(CompletionQueue&, bool ok) override {
+      bool Notify(bool ok) override {
         control_->OnStart(ok);
         return true;
       }
@@ -157,7 +157,7 @@ class AsyncReadStreamImpl
     cq_ = std::move(cq);
     reader_ = async_call(context_.get(), request, &cq_->cq());
     auto callback = std::make_shared<NotifyStart>(this->shared_from_this());
-    void* tag = cq_->RegisterOperation(*this, std::move(callback));
+    void* tag = cq_->RegisterOperation(std::move(callback));
     if (tag != nullptr) {
       reader_->StartCall(tag);
     }
@@ -188,7 +188,7 @@ class AsyncReadStreamImpl
 
      private:
       void Cancel() override {}  // LCOV_EXCL_LINE
-      bool Notify(CompletionQueue&, bool ok) override {
+      bool Notify(bool ok) override {
         control_->OnRead(ok, std::move(response));
         return true;
       }
@@ -197,7 +197,7 @@ class AsyncReadStreamImpl
 
     auto callback = std::make_shared<NotifyRead>(this->shared_from_this());
     auto response = &callback->response;
-    void* tag = cq_->RegisterOperation(*this, std::move(callback));
+    void* tag = cq_->RegisterOperation(std::move(callback));
     if (tag != nullptr) {
       reader_->Read(response, tag);
     }
@@ -238,7 +238,7 @@ class AsyncReadStreamImpl
 
      private:
       void Cancel() override {}  // LCOV_EXCL_LINE
-      bool Notify(CompletionQueue&, bool ok) override {
+      bool Notify(bool ok) override {
         control_->OnFinish(ok, grpc_utils::MakeStatusFromRpcError(status));
         return true;
       }
@@ -247,7 +247,7 @@ class AsyncReadStreamImpl
 
     auto callback = std::make_shared<NotifyFinish>(this->shared_from_this());
     auto status = &callback->status;
-    void* tag = cq_->RegisterOperation(*this, std::move(callback));
+    void* tag = cq_->RegisterOperation(std::move(callback));
     if (tag != nullptr) {
       reader_->Finish(status, tag);
     }
@@ -275,7 +275,7 @@ class AsyncReadStreamImpl
 
      private:
       void Cancel() override {}  // LCOV_EXCL_LINE
-      bool Notify(CompletionQueue&, bool ok) override {
+      bool Notify(bool ok) override {
         control_->OnDiscard(ok, std::move(response));
         return true;
       }
@@ -284,7 +284,7 @@ class AsyncReadStreamImpl
 
     auto callback = std::make_shared<NotifyDiscard>(this->shared_from_this());
     auto response = &callback->response;
-    void* tag = cq_->RegisterOperation(*this, std::move(callback));
+    void* tag = cq_->RegisterOperation(std::move(callback));
     if (tag != nullptr) {
       reader_->Read(response, tag);
     }

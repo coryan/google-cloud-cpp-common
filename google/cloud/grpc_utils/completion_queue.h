@@ -111,7 +111,7 @@ class CompletionQueue {
       std::unique_ptr<grpc::ClientContext> context) {
     auto op =
         std::make_shared<internal::AsyncUnaryRpcFuture<Request, Response>>();
-    void* tag = impl_->RegisterOperation(*this, op);
+    void* tag = impl_->RegisterOperation(op);
     if (tag != nullptr) {
       op->Start(async_call, std::move(context), request, &impl_->cq(), tag);
     }
