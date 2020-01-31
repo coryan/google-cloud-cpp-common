@@ -248,7 +248,7 @@ if (BUILD_TESTING)
         set_target_properties(${target} PROPERTIES OUTPUT_NAME ${basename})
         target_link_libraries(
             ${target}
-            PRIVATE google_cloud_cpp_testing google_cloud_cpp_common
+            PRIVATE google_cloud_cpp_grpc_utils google_cloud_cpp_testing google_cloud_cpp_common
                     GTest::gmock_main GTest::gmock GTest::gtest
                     google_cloud_cpp_common_options)
         if (MSVC)

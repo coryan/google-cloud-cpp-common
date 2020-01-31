@@ -13,15 +13,79 @@
 // limitations under the License.
 
 #include "google/cloud/future.h"
+#include "google/cloud/grpc_utils/completion_queue.h"
 #include "google/cloud/optional.h"
+#include "google/cloud/testing_util/assert_ok.h"
 #include "google/cloud/testing_util/chrono_literals.h"
 #include <gmock/gmock.h>
+#include <deque>
 
 namespace google {
 namespace cloud {
 inline namespace GOOGLE_CLOUD_CPP_NS {
 namespace internal {
 namespace {
+
+using ::testing::ElementsAre;
+
+template <typename T>
+class satisfied_future;
+
+/**
+ * Meets the interface of future<void> without the allocation and locking
+ * overhead.
+ */
+template <>
+class satisfied_future<void> {
+ public:
+  explicit satisfied_future() = default;
+
+  satisfied_future(satisfied_future&&) = default;
+  satisfied_future(satisfied_future const&) = default;
+  satisfied_future& operator=(satisfied_future&&) = default;
+  satisfied_future& operator=(satisfied_future const&) = default;
+
+  void get() {}
+
+  // TODO(coryan) - unwrap functions returning future<U>
+  // TODO(coryan) - unwrap functions returning satisfied_future<U>
+  // TODO(coryan) - use SFINAE to overload for functions taking void or
+  //   future<T> instead of future<T>
+  template <typename Callable,
+            typename U = invoke_result_t<Callable, satisfied_future<void>>>
+  satisfied_future<U> then(Callable&& callable) {
+    return satisfied_future<U>(callable(*this));
+  }
+};
+
+/**
+ * Meets the interface of future<T> without the allocation and locking overhead.
+ */
+template <typename T>
+class satisfied_future {
+ public:
+  explicit satisfied_future(T value) : value_(std::move(value)) {}
+
+  satisfied_future(satisfied_future&&) = default;
+  satisfied_future(satisfied_future const&) = default;
+  satisfied_future& operator=(satisfied_future&&) = default;
+  satisfied_future& operator=(satisfied_future const&) = default;
+
+  T get() { return std::move(value_); }
+
+  // TODO(coryan) - unwrap functions returning future<U>
+  // TODO(coryan) - unwrap functions returning satisfied_future<U>
+  // TODO(coryan) - use SFINAE to overload for functions taking T or future<T>
+  //   instead of future<T>
+  template <typename Callable,
+            typename U = invoke_result_t<Callable, satisfied_future<T>>>
+  satisfied_future<U> then(Callable&& callable) {
+    return satisfied_future<U>(callable(*this));
+  }
+
+ private:
+  T value_;
+};
 
 template <typename T>
 class simple_source {
@@ -138,7 +202,8 @@ class transform_channel_state {
 template <typename T, typename Channel>
 class channel_source : simple_source<T> {
  public:
-  explicit channel_source(std::shared_ptr<Channel> c) : channel_(std::move(c)) {}
+  explicit channel_source(std::shared_ptr<Channel> c)
+      : channel_(std::move(c)) {}
 
   future<optional<T>> async_pull_one() override {
     return channel_->async_pull_one();
@@ -218,6 +283,142 @@ class in_flight_connector {
   simple_sink<T> output_;
 };
 #endif  //
+
+class PeriodicIota : public std::enable_shared_from_this<PeriodicIota> {
+ public:
+  template <typename Duration>
+  static std::shared_ptr<PeriodicIota> Create(grpc_utils::CompletionQueue cq,
+                                              int count,
+                                              Duration const& period) {
+    return std::shared_ptr<PeriodicIota>(
+        new PeriodicIota(std::move(cq), count, period));
+  }
+
+  void start() {
+    std::unique_lock<std::mutex> lk(mu_);
+    Reschedule(lk);
+  }
+
+  future<optional<int>> async_pull_one() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (counter_ >= counter_limit_) {
+      return make_ready_future(optional<int>{});
+    }
+    if (ready_.empty()) {
+      waiters_.push_back(promise<optional<int>>{});
+      return waiters_.back().get_future();
+    }
+    auto p = std::move(ready_.front());
+    ready_.pop_front();
+    return p.get_future();
+  }
+
+ private:
+  template <typename Duration>
+  PeriodicIota(grpc_utils::CompletionQueue cq, int count,
+               Duration const& period)
+      : cq_(std::move(cq)),
+        counter_limit_(count),
+        period_(std::chrono::duration_cast<std::chrono::microseconds>(period)) {
+  }
+
+  void OnTimer() {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (waiters_.empty()) {
+      promise<optional<int>> p;
+      p.set_value(counter_);
+      ++counter_;
+      ready_.push_back(std::move(p));
+      Reschedule(lk);
+      return;
+    }
+    waiters_.front().set_value(counter_);
+    waiters_.pop_front();
+    ++counter_;
+    Reschedule(lk);
+  }
+
+  void Reschedule(std::unique_lock<std::mutex>& lk) {
+    if (counter_ >= counter_limit_) return;
+    lk.unlock();
+
+    auto self = shared_from_this();
+    cq_.MakeRelativeTimer(period_).then(
+        [self](future<StatusOr<std::chrono::system_clock::time_point>> f) {
+          auto tp = f.get();
+          ASSERT_STATUS_OK(tp);  // No expected in tests.
+          self->OnTimer();
+        });
+  }
+
+  grpc_utils::CompletionQueue cq_;
+  std::mutex mu_;
+  int counter_ = 0;
+  int counter_limit_;
+  std::chrono::microseconds period_;
+  std::deque<promise<optional<int>>> waiters_;
+  std::deque<promise<optional<int>>> ready_;
+};
+
+TEST(ChannelTest, MinimalRequirements) {
+  // Create a generator that uses a completion queue with a thread pool and
+  // timers to generate events.
+  grpc_utils::CompletionQueue cq;
+  std::vector<std::thread> pool(4);
+  std::generate_n(pool.begin(), pool.size(), [&cq] {
+    return std::thread{[](grpc_utils::CompletionQueue q) { q.Run(); }, cq};
+  });
+
+  using us = std::chrono::microseconds;
+  auto generator = PeriodicIota::Create(cq, 5, us(10));
+
+  generator->start();
+  std::atomic<bool> done(false);
+  std::vector<int> results;
+  while (!done.load()) {
+    auto next = generator->async_pull_one();
+    next.then([&done, &results](future<optional<int>> f) {
+      auto v = f.get();
+      if (!v) {
+        done.store(true);
+        return;
+      }
+      results.push_back(*v);
+    });
+  }
+  EXPECT_THAT(results, ElementsAre(0, 1, 2, 3, 4));
+
+  cq.Shutdown();
+  for (auto& p : pool) { p.join(); }
+
+  // Attach a function to transform this source, the callbacks should happen in
+  // the thread where the generator is running.
+
+  // Attach a function to split the resulting source in many events, the
+  // the callbacks continue to execute in that thread
+
+  // Attach a sink that pushes the events to a `std::vector`
+
+  // Start the process
+}
+
+TEST(ChannelTest, InFlight) {
+  // A generator that uses a completion queue with a thread pool and a timer to
+  // generate events every X milliseconds.
+
+  // A queue that sends at most N elements to the sink at the same time.
+
+  // A sink that takes 2 * X milliseconds to send the result to a vector.
+}
+
+TEST(ChannelTest, Queue) {
+  // A generator that uses a completion queue with a thread pool and a timer to
+  // generate events every X milliseconds.
+
+  // A sink, this is a queue that keeps events so other threads can send them.
+
+  // A sink that takes 2 * X milliseconds to send the result to a vector.
+}
 
 }  // namespace
 }  // namespace internal
