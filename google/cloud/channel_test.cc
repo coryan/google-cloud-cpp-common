@@ -429,15 +429,136 @@ transformed_source_async<decay_t<Source>, Transform, T, U> transform_source(
  * Transform a source where there is no "on_each" member function.
  */
 template <typename Source, typename Transform,
-    typename T = typename Source::value_type,
-    typename U = invoke_result_t<Transform, T>,
-    typename std::enable_if<has_on_each<Source, Transform>::value,
-                            int>::type = 0>
+          typename T = typename Source::value_type,
+          typename U = invoke_result_t<Transform, T>,
+          typename std::enable_if<has_on_each<Source, Transform>::value,
+                                  int>::type = 0>
 
 transformed_source_async<decay_t<Source>, Transform, T, U> transform_source(
     Source&& source, Transform&& transform) {
   return source.on_each(std::forward<Transform>(transform));
 }
+
+template <typename Source, typename Transform, typename T, typename U>
+class transformed_source {
+ public:
+  // TODO(coryan) - Maybe we do not need to require this
+  using value_type = U;
+
+  transformed_source(Source source, Transform transform)
+      : source_(std::move(source)), transform_(std::move(transform)) {}
+
+  auto start() -> decltype(std::declval<Source>().start()) {
+    return source_.start();
+  }
+
+  template <typename Callable,
+            typename V = invoke_result_t<decay_t<Callable>, U>>
+  transformed_source<transformed_source, decay_t<Callable>, U, V> on_each(
+      Callable&& callable) && {
+    return transformed_source<transformed_source, decay_t<Callable>, U, V>(
+        *this, std::forward<Callable>(callable));
+  }
+
+ private:
+  Source source_;
+  Transform transform_;
+};
+
+class PeriodicCallbackImpl
+    : public std::enable_shared_from_this<PeriodicCallbackImpl> {
+ public:
+  template <typename Duration>
+  static std::shared_ptr<PeriodicCallbackImpl> Create(
+      grpc_utils::CompletionQueue cq, int count, Duration const& period) {
+    return std::shared_ptr<PeriodicCallbackImpl>(
+        new PeriodicCallbackImpl(std::move(cq), count, period));
+  }
+
+  void Start() {
+    std::unique_lock<std::mutex> lk(mu_);
+    Reschedule(lk);
+  }
+
+  void Attach(std::function<void(int)> callback) {
+    std::unique_lock<std::mutex> lk(mu_);
+    callback_ = std::move(callback);
+  }
+
+ private:
+  template <typename Duration>
+  PeriodicCallbackImpl(grpc_utils::CompletionQueue cq, int count,
+                       Duration const& period)
+      : cq_(std::move(cq)),
+        counter_limit_(count),
+        period_(std::chrono::duration_cast<std::chrono::microseconds>(period)),
+        callback_([](int) {}) {}
+
+  void OnTimer() {
+    std::unique_lock<std::mutex> lk(mu_);
+    int value = counter_;
+    lk.unlock();
+    callback_(value);
+    lk.lock();
+    ++counter_;
+    Reschedule(lk);
+  }
+
+  void Reschedule(std::unique_lock<std::mutex>& lk) {
+    if (counter_ >= counter_limit_) {
+      done_.set_value();
+      return;
+    }
+    lk.unlock();
+
+    auto self = shared_from_this();
+    cq_.MakeRelativeTimer(period_).then(
+        [self](future<StatusOr<std::chrono::system_clock::time_point>> f) {
+          auto tp = f.get();
+          ASSERT_STATUS_OK(tp);  // No expected in tests.
+          self->OnTimer();
+        });
+  }
+
+  grpc_utils::CompletionQueue cq_;
+  std::mutex mu_;
+  int counter_ = 0;
+  int counter_limit_;
+  std::chrono::microseconds period_;
+  std::function<void(int)> callback_;
+
+  promise<void> done_;
+};
+
+class PeriodicCallback {
+ public:
+  // TODO(coryan) - Maybe we do not need to require this
+  using value_type = int;
+
+  template <typename Duration>
+  PeriodicCallback(grpc_utils::CompletionQueue cq, int count,
+                   Duration const& period)
+      : impl_(PeriodicCallbackImpl::Create(std::move(cq), count, period)) {}
+
+  future<void> start() && {
+    auto impl = std::move(impl_);
+    impl_->Start();
+  }
+
+  void push(std::function<)
+
+  template <typename Callable,
+            typename U = invoke_result_t<decay_t<Callable>, int>>
+  transformed_source<PeriodicCallback, U> on_each(Callable&& callable) && {
+
+    return transformed_source<PeriodicCallback, U>(
+
+        )
+  }
+
+ private:
+  std::shared_ptr<PeriodicCallbackImpl> impl_;
+};
 
 TEST(ChannelTest, Goal) {
   pipeline p = simple_source<int>{} | [](int x) { return std::to_string(x); } |
