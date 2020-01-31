@@ -246,13 +246,6 @@ void by_line(std::string const& input, simple_sink<std::string> output) {
   }
 }
 
-TEST(ChannelTest, Goal) {
-  pipeline p = simple_source<int>{} | [](int x) { return std::to_string(x); } |
-               transform_channel<std::string, std::string>(by_line) |
-               keep_in_flight<std::string>(8) | simple_sink<std::string>{};
-  p.start();
-}
-
 #if 0
 template <typename T>
 class in_flight_connector {
@@ -286,6 +279,9 @@ class in_flight_connector {
 
 class PeriodicIota : public std::enable_shared_from_this<PeriodicIota> {
  public:
+  // TODO(coryan) - Maybe we do not need to require this
+  using value_type = int;
+
   template <typename Duration>
   static std::shared_ptr<PeriodicIota> Create(grpc_utils::CompletionQueue cq,
                                               int count,
@@ -294,9 +290,10 @@ class PeriodicIota : public std::enable_shared_from_this<PeriodicIota> {
         new PeriodicIota(std::move(cq), count, period));
   }
 
-  void start() {
+  future<void> start() {
     std::unique_lock<std::mutex> lk(mu_);
     Reschedule(lk);
+    return done_.get_future();
   }
 
   future<optional<int>> async_pull_one() {
@@ -339,7 +336,10 @@ class PeriodicIota : public std::enable_shared_from_this<PeriodicIota> {
   }
 
   void Reschedule(std::unique_lock<std::mutex>& lk) {
-    if (counter_ >= counter_limit_) return;
+    if (counter_ >= counter_limit_) {
+      done_.set_value();
+      return;
+    }
     lk.unlock();
 
     auto self = shared_from_this();
@@ -358,7 +358,93 @@ class PeriodicIota : public std::enable_shared_from_this<PeriodicIota> {
   std::chrono::microseconds period_;
   std::deque<promise<optional<int>>> waiters_;
   std::deque<promise<optional<int>>> ready_;
+
+  promise<void> done_;
 };
+
+struct sfinae_false : public std::false_type {};
+struct sfinae_true : public std::true_type {};
+struct do_not_use {};
+
+template <typename Source, typename Functor, typename AlwaysVoid = void>
+struct has_on_each_impl {
+  using type = std::false_type;
+};
+
+template <typename Source, typename Functor>
+struct has_on_each_impl<
+    Source, Functor,
+    void_t<decltype(std::declval<Source>().on_each(std::declval<Functor>()))>> {
+  using type = std::true_type;
+};
+
+template <typename Source, typename Functor>
+struct has_on_each : has_on_each_impl<Source, Functor>::type {};
+
+template <typename Source, typename Transform, typename T, typename U>
+class transformed_source_async {
+ public:
+  // TODO(coryan) - Maybe we do not need to require this
+  using value_type = U;
+
+  transformed_source_async(Source source, Transform transform)
+      : source_(std::move(source)), transform_(std::move(transform)) {}
+
+  auto start() -> decltype(std::declval<Source>().start()) {
+    return source_.start();
+  }
+
+  future<optional<U>> async_pull_one() {
+    // TODO(coryan) - think about lifetime implications of capturing `this`.
+    source_.async_pull_one().then([this](future<optional<T>> f) {
+      auto value = f.get();
+      if (!value) return make_ready_future<optional<U>>({});
+      return make_ready_future(transform_(*std::move(value)));
+    });
+  }
+
+ private:
+  Source source_;
+  Transform transform_;
+};
+
+template <typename T>
+using decay_t = typename std::decay<T>::type;
+
+/**
+ * Transform a source where there is no "on_each" member function.
+ */
+template <typename Source, typename Transform,
+          typename T = typename Source::value_type,
+          typename U = invoke_result_t<Transform, T>,
+          typename std::enable_if<!has_on_each<Source, Transform>::value,
+                                  int>::type = 0>
+transformed_source_async<decay_t<Source>, Transform, T, U> transform_source(
+    Source&& source, Transform&& transform) {
+  return transformed_source_async<decay_t<Source>, decay_t<Transform>, T, U>(
+      std::forward<Source>(source), std::forward<Transform>(transform));
+}
+
+/**
+ * Transform a source where there is no "on_each" member function.
+ */
+template <typename Source, typename Transform,
+    typename T = typename Source::value_type,
+    typename U = invoke_result_t<Transform, T>,
+    typename std::enable_if<has_on_each<Source, Transform>::value,
+                            int>::type = 0>
+
+transformed_source_async<decay_t<Source>, Transform, T, U> transform_source(
+    Source&& source, Transform&& transform) {
+  return source.on_each(std::forward<Transform>(transform));
+}
+
+TEST(ChannelTest, Goal) {
+  pipeline p = simple_source<int>{} | [](int x) { return std::to_string(x); } |
+               transform_channel<std::string, std::string>(by_line) |
+               keep_in_flight<std::string>(8) | simple_sink<std::string>{};
+  p.start();
+}
 
 TEST(ChannelTest, MinimalRequirements) {
   // Create a generator that uses a completion queue with a thread pool and
@@ -389,7 +475,9 @@ TEST(ChannelTest, MinimalRequirements) {
   EXPECT_THAT(results, ElementsAre(0, 1, 2, 3, 4));
 
   cq.Shutdown();
-  for (auto& p : pool) { p.join(); }
+  for (auto& p : pool) {
+    p.join();
+  }
 
   // Attach a function to transform this source, the callbacks should happen in
   // the thread where the generator is running.
