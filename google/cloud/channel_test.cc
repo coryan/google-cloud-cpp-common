@@ -297,6 +297,14 @@ class PeriodicIota {
         period_(std::chrono::duration_cast<std::chrono::microseconds>(period)) {
   }
 
+  PeriodicIota(PeriodicIota&& rhs) noexcept
+      : cq_(std::move(rhs.cq_)),
+        counter_limit_(rhs.counter_limit_),
+        period_(rhs.period_),
+        mu_(),
+        counter_(rhs.counter_),
+        done_(std::move(rhs.done_)) {}
+
   future<void> start() { return done_.get_future(); }
 
   future<optional<int>> async_pull_one() {
@@ -327,10 +335,10 @@ class PeriodicIota {
 
  private:
   grpc_utils::CompletionQueue cq_;
-  std::mutex mu_;
-  int counter_ = 0;
   int counter_limit_;
   std::chrono::microseconds period_;
+  std::mutex mu_;
+  int counter_ = 0;
   promise<void> done_;
 };
 
@@ -367,10 +375,10 @@ class transformed_source_async {
 
   future<optional<U>> async_pull_one() {
     // TODO(coryan) - think about lifetime implications of capturing `this`.
-    source_.async_pull_one().then([this](future<optional<T>> f) {
+    return source_.async_pull_one().then([this](future<optional<T>> f) {
       auto value = f.get();
       if (!value) return make_ready_future<optional<U>>({});
-      return make_ready_future(transform_(*std::move(value)));
+      return make_ready_future<optional<U>>(transform_(*std::move(value)));
     });
   }
 
@@ -427,27 +435,30 @@ TEST(ChannelTest, MinimalRequirements) {
   using us = std::chrono::microseconds;
   PeriodicIota iota(cq, 5, us(10));
 
-  auto iota_done = iota.start();
+  // Attach a function to transform this source, the callbacks should happen in
+  // the thread where the generator is running.
+  auto pipeline = transform_source(std::move(iota), [](int x) {
+                    return 2 * x;
+                  }).transform([](int x) { return x + 3; });
+
+  auto pipeline_done = pipeline.start();
   std::vector<int> results;
 
   std::function<void(future<optional<int>>)> y_combinator;
-  y_combinator = [&y_combinator, &iota, &results](future<optional<int>> f) {
+  y_combinator = [&y_combinator, &pipeline, &results](future<optional<int>> f) {
     auto v = f.get();
     if (!v) return;
     results.push_back(*v);
-    iota.async_pull_one().then(y_combinator);
+    pipeline.async_pull_one().then(y_combinator);
   };
-  iota.async_pull_one().then(y_combinator);
-  iota_done.get();
-  EXPECT_THAT(results, ElementsAre(0, 1, 2, 3, 4));
+  pipeline.async_pull_one().then(y_combinator);
+  pipeline_done.get();
+  EXPECT_THAT(results, ElementsAre(3, 5, 7, 9, 11));
 
   cq.Shutdown();
   for (auto& p : pool) {
     p.join();
   }
-
-  // Attach a function to transform this source, the callbacks should happen in
-  // the thread where the generator is running.
 
   // Attach a function to split the resulting source in many events, the
   // the callbacks continue to execute in that thread
