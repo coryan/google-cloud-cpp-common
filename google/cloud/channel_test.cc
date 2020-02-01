@@ -277,40 +277,18 @@ class in_flight_connector {
 };
 #endif  //
 
-class PeriodicIota : public std::enable_shared_from_this<PeriodicIota> {
+/**
+ * Simulate a gRPC streaming read API.
+ *
+ * These RPCs are long lived, and they require an explicit Read() call to get
+ * the next value, which arrives at an unpredictable time.
+ */
+class PeriodicIota {
  public:
-  // TODO(coryan) - Maybe we do not need to require this
+  // TODO(coryan) - Maybe we can compute this type but for prototyping this
+  //  is good enough.
   using value_type = int;
 
-  template <typename Duration>
-  static std::shared_ptr<PeriodicIota> Create(grpc_utils::CompletionQueue cq,
-                                              int count,
-                                              Duration const& period) {
-    return std::shared_ptr<PeriodicIota>(
-        new PeriodicIota(std::move(cq), count, period));
-  }
-
-  future<void> start() {
-    std::unique_lock<std::mutex> lk(mu_);
-    Reschedule(lk);
-    return done_.get_future();
-  }
-
-  future<optional<int>> async_pull_one() {
-    std::lock_guard<std::mutex> lk(mu_);
-    if (counter_ >= counter_limit_) {
-      return make_ready_future(optional<int>{});
-    }
-    if (ready_.empty()) {
-      waiters_.push_back(promise<optional<int>>{});
-      return waiters_.back().get_future();
-    }
-    auto p = std::move(ready_.front());
-    ready_.pop_front();
-    return p.get_future();
-  }
-
- private:
   template <typename Duration>
   PeriodicIota(grpc_utils::CompletionQueue cq, int count,
                Duration const& period)
@@ -319,72 +297,65 @@ class PeriodicIota : public std::enable_shared_from_this<PeriodicIota> {
         period_(std::chrono::duration_cast<std::chrono::microseconds>(period)) {
   }
 
-  void OnTimer() {
-    std::unique_lock<std::mutex> lk(mu_);
-    if (waiters_.empty()) {
-      promise<optional<int>> p;
-      p.set_value(counter_);
-      ++counter_;
-      ready_.push_back(std::move(p));
-      Reschedule(lk);
-      return;
-    }
-    waiters_.front().set_value(counter_);
-    waiters_.pop_front();
-    ++counter_;
-    Reschedule(lk);
-  }
+  future<void> start() { return done_.get_future(); }
 
-  void Reschedule(std::unique_lock<std::mutex>& lk) {
+  future<optional<int>> async_pull_one() {
+    std::lock_guard<std::mutex> lk(mu_);
     if (counter_ >= counter_limit_) {
       done_.set_value();
-      return;
+      return make_ready_future(optional<int>{});
     }
-    lk.unlock();
 
-    auto self = shared_from_this();
-    cq_.MakeRelativeTimer(period_).then(
-        [self](future<StatusOr<std::chrono::system_clock::time_point>> f) {
-          auto tp = f.get();
-          ASSERT_STATUS_OK(tp);  // No expected in tests.
-          self->OnTimer();
-        });
+    // Workaround lack of C++14 generalized lambda captures.
+    struct OnTimer {
+      void operator()(
+          future<StatusOr<std::chrono::system_clock::time_point>> f) {
+        auto tp = f.get();
+        EXPECT_STATUS_OK(tp);  // No expected in tests.
+        promise.set_value(counter);
+      }
+      promise<optional<int>> promise;
+      int counter;
+    };
+
+    promise<optional<int>> promise;
+    auto f = promise.get_future();
+    cq_.MakeRelativeTimer(period_).then(OnTimer{std::move(promise), counter_});
+    ++counter_;
+    return f;
   }
 
+ private:
   grpc_utils::CompletionQueue cq_;
   std::mutex mu_;
   int counter_ = 0;
   int counter_limit_;
   std::chrono::microseconds period_;
-  std::deque<promise<optional<int>>> waiters_;
-  std::deque<promise<optional<int>>> ready_;
-
   promise<void> done_;
 };
 
 struct sfinae_false : public std::false_type {};
 struct sfinae_true : public std::true_type {};
 struct do_not_use {};
+template <typename T>
+using decay_t = typename std::decay<T>::type;
 
-template <typename Source, typename Functor, typename AlwaysVoid = void>
-struct has_on_each_impl {
-  using type = std::false_type;
+template <typename F, typename G, typename T,
+          typename U = invoke_result_t<F, invoke_result_t<G, T>>>
+struct Composed {
+  using result_type = U;
+
+  U operator()(T value) { return f_(g_(std::move(value))); }
+
+  F f_;
+  G g_;
 };
 
-template <typename Source, typename Functor>
-struct has_on_each_impl<
-    Source, Functor,
-    void_t<decltype(std::declval<Source>().on_each(std::declval<Functor>()))>> {
-  using type = std::true_type;
-};
-
-template <typename Source, typename Functor>
-struct has_on_each : has_on_each_impl<Source, Functor>::type {};
-
-template <typename Source, typename Transform, typename T, typename U>
+template <typename Source, typename Transform, typename T,
+          typename U = invoke_result_t<Transform, T>>
 class transformed_source_async {
  public:
-  // TODO(coryan) - Maybe we do not need to require this
+  // TODO(coryan) - compute this, maybe.
   using value_type = U;
 
   transformed_source_async(Source source, Transform transform)
@@ -403,61 +374,11 @@ class transformed_source_async {
     });
   }
 
- private:
-  Source source_;
-  Transform transform_;
-};
-
-template <typename T>
-using decay_t = typename std::decay<T>::type;
-
-/**
- * Transform a source where there is no "on_each" member function.
- */
-template <typename Source, typename Transform,
-          typename T = typename Source::value_type,
-          typename U = invoke_result_t<Transform, T>,
-          typename std::enable_if<!has_on_each<Source, Transform>::value,
-                                  int>::type = 0>
-transformed_source_async<decay_t<Source>, Transform, T, U> transform_source(
-    Source&& source, Transform&& transform) {
-  return transformed_source_async<decay_t<Source>, decay_t<Transform>, T, U>(
-      std::forward<Source>(source), std::forward<Transform>(transform));
-}
-
-/**
- * Transform a source where there is no "on_each" member function.
- */
-template <typename Source, typename Transform,
-          typename T = typename Source::value_type,
-          typename U = invoke_result_t<Transform, T>,
-          typename std::enable_if<has_on_each<Source, Transform>::value,
-                                  int>::type = 0>
-
-transformed_source_async<decay_t<Source>, Transform, T, U> transform_source(
-    Source&& source, Transform&& transform) {
-  return source.on_each(std::forward<Transform>(transform));
-}
-
-template <typename Source, typename Transform, typename T, typename U>
-class transformed_source {
- public:
-  // TODO(coryan) - Maybe we do not need to require this
-  using value_type = U;
-
-  transformed_source(Source source, Transform transform)
-      : source_(std::move(source)), transform_(std::move(transform)) {}
-
-  auto start() -> decltype(std::declval<Source>().start()) {
-    return source_.start();
-  }
-
-  template <typename Callable,
-            typename V = invoke_result_t<decay_t<Callable>, U>>
-  transformed_source<transformed_source, decay_t<Callable>, U, V> on_each(
-      Callable&& callable) && {
-    return transformed_source<transformed_source, decay_t<Callable>, U, V>(
-        *this, std::forward<Callable>(callable));
+  template <typename Transform2,
+            typename C = Composed<decay_t<Transform2>, Transform, T>>
+  transformed_source_async<Source, C, T> transform(Transform2&& t2) && {
+    return {std::move(source_),
+            C{std::forward<Transform2>(t2), std::move(transform_)}};
   }
 
  private:
@@ -465,100 +386,27 @@ class transformed_source {
   Transform transform_;
 };
 
-class PeriodicCallbackImpl
-    : public std::enable_shared_from_this<PeriodicCallbackImpl> {
- public:
-  template <typename Duration>
-  static std::shared_ptr<PeriodicCallbackImpl> Create(
-      grpc_utils::CompletionQueue cq, int count, Duration const& period) {
-    return std::shared_ptr<PeriodicCallbackImpl>(
-        new PeriodicCallbackImpl(std::move(cq), count, period));
-  }
+/**
+ * Transform a generic source.
+ */
+template <typename Source, typename Transform,
+          typename T = typename Source::value_type>
+transformed_source_async<decay_t<Source>, Transform, T> transform_source(
+    Source&& source, Transform&& transform) {
+  return transformed_source_async<decay_t<Source>, decay_t<Transform>, T>{
+      std::forward<Source>(source), std::forward<Transform>(transform)};
+}
 
-  void Start() {
-    std::unique_lock<std::mutex> lk(mu_);
-    Reschedule(lk);
-  }
-
-  void Attach(std::function<void(int)> callback) {
-    std::unique_lock<std::mutex> lk(mu_);
-    callback_ = std::move(callback);
-  }
-
- private:
-  template <typename Duration>
-  PeriodicCallbackImpl(grpc_utils::CompletionQueue cq, int count,
-                       Duration const& period)
-      : cq_(std::move(cq)),
-        counter_limit_(count),
-        period_(std::chrono::duration_cast<std::chrono::microseconds>(period)),
-        callback_([](int) {}) {}
-
-  void OnTimer() {
-    std::unique_lock<std::mutex> lk(mu_);
-    int value = counter_;
-    lk.unlock();
-    callback_(value);
-    lk.lock();
-    ++counter_;
-    Reschedule(lk);
-  }
-
-  void Reschedule(std::unique_lock<std::mutex>& lk) {
-    if (counter_ >= counter_limit_) {
-      done_.set_value();
-      return;
-    }
-    lk.unlock();
-
-    auto self = shared_from_this();
-    cq_.MakeRelativeTimer(period_).then(
-        [self](future<StatusOr<std::chrono::system_clock::time_point>> f) {
-          auto tp = f.get();
-          ASSERT_STATUS_OK(tp);  // No expected in tests.
-          self->OnTimer();
-        });
-  }
-
-  grpc_utils::CompletionQueue cq_;
-  std::mutex mu_;
-  int counter_ = 0;
-  int counter_limit_;
-  std::chrono::microseconds period_;
-  std::function<void(int)> callback_;
-
-  promise<void> done_;
-};
-
-class PeriodicCallback {
- public:
-  // TODO(coryan) - Maybe we do not need to require this
-  using value_type = int;
-
-  template <typename Duration>
-  PeriodicCallback(grpc_utils::CompletionQueue cq, int count,
-                   Duration const& period)
-      : impl_(PeriodicCallbackImpl::Create(std::move(cq), count, period)) {}
-
-  future<void> start() && {
-    auto impl = std::move(impl_);
-    impl_->Start();
-  }
-
-  void push(std::function<)
-
-  template <typename Callable,
-            typename U = invoke_result_t<decay_t<Callable>, int>>
-  transformed_source<PeriodicCallback, U> on_each(Callable&& callable) && {
-
-    return transformed_source<PeriodicCallback, U>(
-
-        )
-  }
-
- private:
-  std::shared_ptr<PeriodicCallbackImpl> impl_;
-};
+/**
+ * Transform a transformed source.
+ */
+template <typename Source, typename Tr1, typename Tr2,
+          typename T = typename Source::value_type>
+auto transform_source(transformed_source_async<Source, Tr1, T> source,
+                      Tr2&& transform)
+    -> decltype(std::move(source).transform(std::forward<Tr2>(transform))) {
+  return std::move(source).transform(std::forward<Tr2>(transform));
+}
 
 TEST(ChannelTest, Goal) {
   pipeline p = simple_source<int>{} | [](int x) { return std::to_string(x); } |
@@ -577,22 +425,20 @@ TEST(ChannelTest, MinimalRequirements) {
   });
 
   using us = std::chrono::microseconds;
-  auto generator = PeriodicIota::Create(cq, 5, us(10));
+  PeriodicIota iota(cq, 5, us(10));
 
-  generator->start();
-  std::atomic<bool> done(false);
+  auto iota_done = iota.start();
   std::vector<int> results;
-  while (!done.load()) {
-    auto next = generator->async_pull_one();
-    next.then([&done, &results](future<optional<int>> f) {
-      auto v = f.get();
-      if (!v) {
-        done.store(true);
-        return;
-      }
-      results.push_back(*v);
-    });
-  }
+
+  std::function<void(future<optional<int>>)> y_combinator;
+  y_combinator = [&y_combinator, &iota, &results](future<optional<int>> f) {
+    auto v = f.get();
+    if (!v) return;
+    results.push_back(*v);
+    iota.async_pull_one().then(y_combinator);
+  };
+  iota.async_pull_one().then(y_combinator);
+  iota_done.get();
   EXPECT_THAT(results, ElementsAre(0, 1, 2, 3, 4));
 
   cq.Shutdown();
