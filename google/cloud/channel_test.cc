@@ -437,15 +437,19 @@ TEST(ChannelTest, MinimalRequirements) {
 
   // Attach a function to transform this source, the callbacks should happen in
   // the thread where the generator is running.
-  auto pipeline = transform_source(std::move(iota), [](int x) {
-                    return 2 * x;
-                  }).transform([](int x) { return x + 3; });
+  auto p1 = transform_source(std::move(iota), [](int x) {
+              return 2 * x;
+            }).transform([](int x) { return x + 3; });
+
+  auto pipeline =
+      transform_source(std::move(p1), [](int x) { return std::to_string(x); });
 
   auto pipeline_done = pipeline.start();
-  std::vector<int> results;
+  std::vector<std::string> results;
 
-  std::function<void(future<optional<int>>)> y_combinator;
-  y_combinator = [&y_combinator, &pipeline, &results](future<optional<int>> f) {
+  std::function<void(future<optional<std::string>>)> y_combinator;
+  y_combinator = [&y_combinator, &pipeline,
+                  &results](future<optional<std::string>> f) {
     auto v = f.get();
     if (!v) return;
     results.push_back(*v);
@@ -453,7 +457,7 @@ TEST(ChannelTest, MinimalRequirements) {
   };
   pipeline.async_pull_one().then(y_combinator);
   pipeline_done.get();
-  EXPECT_THAT(results, ElementsAre(3, 5, 7, 9, 11));
+  EXPECT_THAT(results, ElementsAre("3", "5", "7", "9", "11"));
 
   cq.Shutdown();
   for (auto& p : pool) {
