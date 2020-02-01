@@ -88,26 +88,25 @@ class satisfied_future {
 };
 
 /**
- * Simulate a gRPC streaming read API.
+ * Simulate a gRPC streaming read RPC.
  *
  * These RPCs are long lived, and they require an explicit Read() call to get
  * the next value, which arrives at an unpredictable time.
  */
-class PeriodicIota {
+class SlowIota {
  public:
   // TODO(coryan) - Maybe we can compute this type but for prototyping this
   //  is good enough.
   using value_type = int;
 
   template <typename Duration>
-  PeriodicIota(grpc_utils::CompletionQueue cq, int count,
-               Duration const& period)
+  SlowIota(grpc_utils::CompletionQueue cq, int count, Duration const& period)
       : cq_(std::move(cq)),
         counter_limit_(count),
         period_(std::chrono::duration_cast<std::chrono::microseconds>(period)) {
   }
 
-  PeriodicIota(PeriodicIota&& rhs) noexcept
+  SlowIota(SlowIota&& rhs) noexcept
       : cq_(std::move(rhs.cq_)),
         counter_limit_(rhs.counter_limit_),
         period_(rhs.period_),
@@ -150,6 +149,39 @@ class PeriodicIota {
   std::mutex mu_;
   int counter_ = 0;
   promise<void> done_;
+};
+
+/**
+ * Simulate a gRPC streaming write RPC.
+ */
+template <typename T>
+class SlowPushBack {
+ public:
+  // TODO(coryan) - Maybe we can compute this type but for prototyping this
+  //  is good enough.
+  using value_type = T;
+
+  template <typename Duration>
+  SlowPushBack(grpc_utils::CompletionQueue cq, Duration const& period)
+      : cq_(std::move(cq)),
+        period_(std::chrono::duration_cast<std::chrono::microseconds>(period)) {
+  }
+
+  future<std::vector<T>> results() { return promise_.get_future(); }
+
+  future<void> push(T value) {
+    accumulator_.push_back(std::move(value));
+    return cq_.MakeRelativeTimer(period_).then(
+        [](future<StatusOr<std::chrono::system_clock::time_point>>) {});
+  }
+
+  void shutdown() { promise_.set_value(std::move(accumulator_)); }
+
+ private:
+  grpc_utils::CompletionQueue cq_;
+  std::chrono::microseconds period_;
+  promise<std::vector<T>> promise_;
+  std::vector<T> accumulator_;
 };
 
 struct sfinae_false : public std::false_type {};
@@ -271,6 +303,44 @@ unpacked_source_async<decay_t<Source>> unpack_source(Source&& source) {
   return unpacked_source_async<decay_t<Source>>(std::forward<Source>(source));
 }
 
+template <typename Source, typename Sink>
+class pipeline_async {
+ public:
+  using value_type = typename Source::value_type;
+
+  pipeline_async(Source source, Sink sink)
+      : source_(std::move(source)), sink_(std::move(sink)) {}
+
+  auto start() -> decltype(std::declval<Source>().start()) {
+    schedule_next();
+    return source_.start();
+  }
+
+ private:
+  void schedule_next() {
+    source_.async_pull_one().then([this](future<optional<value_type>> f) {
+      auto value = f.get();
+      if (!value) {
+        sink_.shutdown();
+        return;
+      }
+      sink_.push(*std::move(value)).then([this](future<void>) {
+        schedule_next();
+      });
+    });
+  }
+
+  Source source_;
+  Sink sink_;
+};
+
+template <typename Source, typename Sink>
+pipeline_async<decay_t<Source>, decay_t<Sink>> connect(Source&& source,
+                                                       Sink&& sink) {
+  return pipeline_async<decay_t<Source>, decay_t<Sink>>(
+      std::forward<Source>(source), std::forward<Sink>(sink));
+}
+
 TEST(ChannelTest, MinimalRequirements) {
   // Create a generator that uses a completion queue with a thread pool and
   // timers to generate events.
@@ -281,7 +351,7 @@ TEST(ChannelTest, MinimalRequirements) {
   });
 
   using us = std::chrono::microseconds;
-  PeriodicIota iota(cq, 2, us(10));
+  SlowIota iota(cq, 2, us(10));
 
   // Attach a function to transform this source, the callbacks should happen in
   // the thread where the generator is running.
@@ -297,26 +367,21 @@ TEST(ChannelTest, MinimalRequirements) {
   auto p3 = transform_source(std::move(p2), [](std::string const& x) {
     return std::vector<std::string>{x + " a", x + " b", x + " c"};
   });
-  auto pipeline = unpack_source(std::move(p3));
+  auto p4 = unpack_source(std::move(p3));
 
   // Attach a sink that pushes the events to a `std::vector`
+  SlowPushBack<std::string> sink(cq, us(1));
+  auto results = sink.results();
 
-  // Start the process
-  auto pipeline_done = pipeline.start();
-  std::vector<std::string> results;
+  auto pipeline = connect(std::move(p4), std::move(sink));
 
-  std::function<void(future<optional<std::string>>)> y_combinator;
-  y_combinator = [&y_combinator, &pipeline,
-                  &results](future<optional<std::string>> f) {
-    auto v = f.get();
-    if (!v) return;
-    results.push_back(*v);
-    pipeline.async_pull_one().then(y_combinator);
-  };
-  pipeline.async_pull_one().then(y_combinator);
-  pipeline_done.get();
-  EXPECT_THAT(results, ElementsAre("3 a", "3 b", "3 c", "5 a", "5 b", "5 c"));
+  // Start the process and block until completed (a real program would log or
+  // discard the `pipeline_done` result):
+  pipeline.start().get();
+  EXPECT_THAT(results.get(),
+              ElementsAre("3 a", "3 b", "3 c", "5 a", "5 b", "5 c"));
 
+  // Shutdown the completion queue and block.
   cq.Shutdown();
   for (auto& p : pool) {
     p.join();
@@ -538,9 +603,7 @@ TEST(ChannelTest, Goal) {
   p.start();
 }
 
-
 #endif  //
-
 
 }  // namespace
 }  // namespace internal
