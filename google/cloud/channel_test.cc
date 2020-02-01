@@ -416,6 +416,51 @@ auto transform_source(transformed_source_async<Source, Tr1, T> source,
   return std::move(source).transform(std::forward<Tr2>(transform));
 }
 
+template <typename Source>
+class unpacked_source_async {
+ public:
+  // TODO(coryan) - compute this, maybe.
+  using value_type = typename Source::value_type::value_type;
+
+  explicit unpacked_source_async(Source source) : source_(std::move(source)) {}
+
+  auto start() -> decltype(std::declval<Source>().start()) {
+    return source_.start();
+  }
+
+  future<optional<value_type>> async_pull_one() {
+    if (!pending_.empty()) {
+      auto value = std::move(pending_.front());
+      pending_.pop_front();
+      return make_ready_future<optional<value_type>>(std::move(value));
+    }
+    // TODO(coryan) - think about lifetime implications of capturing `this`.
+    using Collection = typename Source::value_type;
+    return source_.async_pull_one().then(
+        [this](future<optional<Collection>> f) {
+          auto values = f.get();
+          if (!values) return make_ready_future<optional<value_type>>({});
+
+          for (auto& item : *values) {
+            pending_.push_back(std::move(item));
+          }
+          return async_pull_one();
+        });
+  }
+
+ private:
+  Source source_;
+  std::deque<value_type> pending_;
+};
+
+/**
+ * Unpack a source that returns collections.
+ */
+template <typename Source>
+unpacked_source_async<decay_t<Source>> unpack_source(Source&& source) {
+  return unpacked_source_async<decay_t<Source>>(std::forward<Source>(source));
+}
+
 TEST(ChannelTest, Goal) {
   pipeline p = simple_source<int>{} | [](int x) { return std::to_string(x); } |
                transform_channel<std::string, std::string>(by_line) |
@@ -433,7 +478,7 @@ TEST(ChannelTest, MinimalRequirements) {
   });
 
   using us = std::chrono::microseconds;
-  PeriodicIota iota(cq, 5, us(10));
+  PeriodicIota iota(cq, 2, us(10));
 
   // Attach a function to transform this source, the callbacks should happen in
   // the thread where the generator is running.
@@ -441,9 +486,19 @@ TEST(ChannelTest, MinimalRequirements) {
               return 2 * x;
             }).transform([](int x) { return x + 3; });
 
-  auto pipeline =
+  auto p2 =
       transform_source(std::move(p1), [](int x) { return std::to_string(x); });
 
+  // Attach a function to split the resulting source in many events, the
+  // the callbacks continue to execute in that thread
+  auto p3 = transform_source(std::move(p2), [](std::string const& x) {
+    return std::vector<std::string>{x + " a", x + " b", x + " c"};
+  });
+  auto pipeline = unpack_source(std::move(p3));
+
+  // Attach a sink that pushes the events to a `std::vector`
+
+  // Start the process
   auto pipeline_done = pipeline.start();
   std::vector<std::string> results;
 
@@ -457,19 +512,12 @@ TEST(ChannelTest, MinimalRequirements) {
   };
   pipeline.async_pull_one().then(y_combinator);
   pipeline_done.get();
-  EXPECT_THAT(results, ElementsAre("3", "5", "7", "9", "11"));
+  EXPECT_THAT(results, ElementsAre("3 a", "3 b", "3 c", "5 a", "5 b", "5 c"));
 
   cq.Shutdown();
   for (auto& p : pool) {
     p.join();
   }
-
-  // Attach a function to split the resulting source in many events, the
-  // the callbacks continue to execute in that thread
-
-  // Attach a sink that pushes the events to a `std::vector`
-
-  // Start the process
 }
 
 TEST(ChannelTest, InFlight) {
