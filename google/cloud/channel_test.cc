@@ -318,13 +318,15 @@ class pipeline_async {
 
  private:
   void schedule_next() {
-    source_.async_pull_one().then([this](future<optional<value_type>> f) {
+    using pull_future = decltype(source_.async_pull_one());
+    source_.async_pull_one().then([this](pull_future f) {
       auto value = f.get();
       if (!value) {
         sink_.shutdown();
         return;
       }
-      sink_.push(*std::move(value)).then([this](future<void>) {
+      using push_future = decltype(sink_.push(*std::move(value)));
+      sink_.push(*std::move(value)).then([this](push_future) {
         schedule_next();
       });
     });
@@ -388,13 +390,120 @@ TEST(ChannelTest, MinimalRequirements) {
   }
 }
 
+TEST(ChannelTest, SynchronousSink) {
+  // An asynchronous source sending to a blocking sink.
+}
+
+TEST(ChannelTest, TypeErasedSource) {
+  // Create a type-erased source from a complex source
+}
+
+TEST(ChannelTest, TypeErasedPipeline) {
+  // Create a type-erased pipeline from a complex pipeline.
+}
+
+/// A Sink that keeps at most N requests pending.
+template <typename AsyncFunctor, typename T>
+class max_pending_flow_control {
+ public:
+  max_pending_flow_control(AsyncFunctor functor, std::size_t max_pending)
+      : functor_(std::move(functor)), max_pending_(max_pending) {}
+
+  max_pending_flow_control(max_pending_flow_control&& rhs) noexcept
+      : functor_(std::move(rhs.functor_)),
+        max_pending_(rhs.max_pending_),
+        pending_count_(0) {}
+
+  future<void> push(T value) {
+    std::unique_lock<std::mutex> lk(mu_);
+    using async_functor_future = decltype(functor_(std::move(value)));
+    if (pending_count_ < max_pending_) {
+      ++pending_count_;
+      lk.unlock();
+      promise<void> p;
+      auto f = p.get_future();
+      // TODO(coryan) - we need you C++14, you are our only hope.
+      struct CaptureByMove {
+        max_pending_flow_control* self;
+        promise<void> promise;
+        void operator()(async_functor_future) {
+          self->on_completion();
+        }
+      };
+      functor_(std::move(value)).then(CaptureByMove{this, std::move(p)});
+      return f;
+    }
+
+    promise<void> p;
+    // TODO(coryan) - move the value capture.
+    auto f = p.get_future().then([value, this](future<void>) {
+      std::unique_lock<std::mutex> lk(mu_);
+      ++pending_count_;
+      lk.unlock();
+      return functor_(std::move(value)).then([this](async_functor_future) {
+        on_completion();
+      });
+    });
+    queued_requests_.push_back(std::move(p));
+    return f;
+  }
+
+  void shutdown() {
+    // TODO(coryan) - wait until they all finish.
+  }
+
+ private:
+  void on_completion() {
+    std::unique_lock<std::mutex> lk(mu_);
+    if (--pending_count_ >= max_pending_ || queued_requests_.empty()) return;
+    auto p = std::move(queued_requests_.front());
+    queued_requests_.pop_front();
+    p.set_value();
+  }
+
+  AsyncFunctor functor_;
+  std::size_t max_pending_;
+  std::mutex mu_;
+  std::size_t pending_count_ = 0;
+  std::deque<promise<void>> queued_requests_;
+};
+
+template <typename T, typename AsyncFunctor>
+max_pending_flow_control<decay_t<AsyncFunctor>, T> in_flight(
+    AsyncFunctor&& functor, std::size_t max_pending) {
+  return max_pending_flow_control<decay_t<AsyncFunctor>, T>(
+      std::forward<AsyncFunctor>(functor), max_pending);
+}
+
 TEST(ChannelTest, InFlight) {
   // A generator that uses a completion queue with a thread pool and a timer to
   // generate events every X milliseconds.
+  grpc_utils::CompletionQueue cq;
+  std::vector<std::thread> pool(4);
+  std::generate_n(pool.begin(), pool.size(), [&cq] {
+    return std::thread{[](grpc_utils::CompletionQueue q) { q.Run(); }, cq};
+  });
 
-  // A queue that sends at most N elements to the sink at the same time.
+  using us = std::chrono::microseconds;
+  SlowIota iota(cq, 6, us(10));
 
-  // A sink that takes 2 * X milliseconds to send the result to a vector.
+  std::vector<int> values;
+  auto functor = [&values](int x) {
+    values.push_back(x);
+    // TODO(coryan) - make this work with a `satisfied_future<void>`.
+    return make_ready_future();
+  };
+
+  auto sink = in_flight<int>(std::move(functor), 2);
+  auto pipeline = connect(std::move(iota), std::move(sink));
+  pipeline.start().get();
+  EXPECT_THAT(values, ElementsAre(0, 1, 2, 3, 4, 5));
+
+  // Shutdown the completion queue and block.
+  cq.Shutdown();
+  for (auto& p : pool) {
+    p.join();
+  }
 }
 
 TEST(ChannelTest, Queue) {
