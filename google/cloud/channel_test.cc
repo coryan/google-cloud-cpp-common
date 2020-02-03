@@ -259,12 +259,12 @@ auto transform_source(transformed_source_async<Source, Tr1, T> source,
 }
 
 template <typename Source>
-class unpacked_source_async {
+class flattened_source_async {
  public:
   // TODO(coryan) - compute this, maybe.
   using value_type = typename Source::value_type::value_type;
 
-  explicit unpacked_source_async(Source source) : source_(std::move(source)) {}
+  explicit flattened_source_async(Source source) : source_(std::move(source)) {}
 
   auto start() -> decltype(std::declval<Source>().start()) {
     return source_.start();
@@ -299,8 +299,8 @@ class unpacked_source_async {
  * Unpack a source that returns collections.
  */
 template <typename Source>
-unpacked_source_async<decay_t<Source>> unpack_source(Source&& source) {
-  return unpacked_source_async<decay_t<Source>>(std::forward<Source>(source));
+flattened_source_async<decay_t<Source>> flatten(Source&& source) {
+  return flattened_source_async<decay_t<Source>>(std::forward<Source>(source));
 }
 
 template <typename Source, typename Sink>
@@ -369,7 +369,7 @@ TEST(ChannelTest, MinimalRequirements) {
   auto p3 = transform_source(std::move(p2), [](std::string const& x) {
     return std::vector<std::string>{x + " a", x + " b", x + " c"};
   });
-  auto p4 = unpack_source(std::move(p3));
+  auto p4 = flatten(std::move(p3));
 
   // Attach a sink that pushes the events to a `std::vector`
   SlowPushBack<std::string> sink(cq, us(1));
