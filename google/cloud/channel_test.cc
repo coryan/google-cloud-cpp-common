@@ -129,9 +129,9 @@ class SlowIota {
           future<StatusOr<std::chrono::system_clock::time_point>> f) {
         auto tp = f.get();
         EXPECT_STATUS_OK(tp);  // No expected in tests.
-        promise.set_value(counter);
+        p.set_value(counter);
       }
-      promise<optional<int>> promise;
+      promise<optional<int>> p;
       int counter;
     };
 
@@ -425,9 +425,10 @@ class max_pending_flow_control {
       // TODO(coryan) - we need you C++14, you are our only hope.
       struct CaptureByMove {
         max_pending_flow_control* self;
-        promise<void> promise;
+        promise<void> p;
         void operator()(async_functor_future) {
           self->on_completion();
+          p.set_value();
         }
       };
       functor_(std::move(value)).then(CaptureByMove{this, std::move(p)});
