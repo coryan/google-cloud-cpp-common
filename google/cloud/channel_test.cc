@@ -116,7 +116,7 @@ class SlowIota {
 
   future<void> start() { return done_.get_future(); }
 
-  future<optional<int>> async_pull_one() {
+  future<optional<int>> async_next() {
     std::lock_guard<std::mutex> lk(mu_);
     if (counter_ >= counter_limit_) {
       done_.set_value();
@@ -215,9 +215,9 @@ class transformed_source_async {
     return source_.start();
   }
 
-  future<optional<U>> async_pull_one() {
+  future<optional<U>> async_next() {
     // TODO(coryan) - think about lifetime implications of capturing `this`.
-    return source_.async_pull_one().then([this](future<optional<T>> f) {
+    return source_.async_next().then([this](future<optional<T>> f) {
       auto value = f.get();
       if (!value) return make_ready_future<optional<U>>({});
       return make_ready_future<optional<U>>(transform_(*std::move(value)));
@@ -270,7 +270,7 @@ class flattened_source_async {
     return source_.start();
   }
 
-  future<optional<value_type>> async_pull_one() {
+  future<optional<value_type>> async_next() {
     if (!pending_.empty()) {
       auto value = std::move(pending_.front());
       pending_.pop_front();
@@ -278,7 +278,7 @@ class flattened_source_async {
     }
     // TODO(coryan) - think about lifetime implications of capturing `this`.
     using Collection = typename Source::value_type;
-    return source_.async_pull_one().then(
+    return source_.async_next().then(
         [this](future<optional<Collection>> f) {
           auto values = f.get();
           if (!values) return make_ready_future<optional<value_type>>({});
@@ -286,7 +286,7 @@ class flattened_source_async {
           for (auto& item : *values) {
             pending_.push_back(std::move(item));
           }
-          return async_pull_one();
+          return async_next();
         });
   }
 
@@ -318,8 +318,8 @@ class pipeline_async {
 
  private:
   void schedule_next() {
-    using pull_future = decltype(source_.async_pull_one());
-    source_.async_pull_one().then([this](pull_future f) {
+    using pull_future = decltype(source_.async_next());
+    source_.async_next().then([this](pull_future f) {
       auto value = f.get();
       if (!value) {
         sink_.shutdown();
@@ -521,7 +521,7 @@ template <typename T>
 class simple_source {
  public:
   virtual void start() {}
-  virtual future<optional<T>> async_pull_one() { return {}; }
+  virtual future<optional<T>> async_next() { return {}; }
 };
 
 template <typename T>
@@ -597,8 +597,8 @@ class transform_channel_state {
     schedule();
     generator_input_.start();
   }
-  future<optional<O>> async_pull_one() {
-    return channel_output_.async_pull_one();
+  future<optional<O>> async_next() {
+    return channel_output_.async_next();
   }
   //@}
 
@@ -611,7 +611,7 @@ class transform_channel_state {
 
  private:
   void schedule() {
-    generator_input_.async_pull_one().then([this](future<optional<I>> f) {
+    generator_input_.async_next().then([this](future<optional<I>> f) {
       auto o = f.get();
       if (!o.has_value()) {
         generator_output_.shutdown();
@@ -635,8 +635,8 @@ class channel_source : simple_source<T> {
   explicit channel_source(std::shared_ptr<Channel> c)
       : channel_(std::move(c)) {}
 
-  future<optional<T>> async_pull_one() override {
-    return channel_->async_pull_one();
+  future<optional<T>> async_next() override {
+    return channel_->async_next();
   }
   void start() override { return channel_->start(); }
 
@@ -696,7 +696,7 @@ class in_flight_connector {
 
  private:
   void done() {
-    input_.async_pull_one().then(
+    input_.async_next().then(
         [this](future<optional<std::string>> f) { send_one(f.get()); });
   }
 
